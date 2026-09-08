@@ -1,255 +1,205 @@
-# État des lieux — 2026-09-08
+# État des lieux — 8 septembre 2026
 
-Ce document dit ce qui marche, ce qui ne marche pas, et ce qui est cassé exprès. Il est
-écrit pour que quelqu'un qui arrive comprenne la situation en cinq minutes sans lire le
-plan d'exécution de 3 000 lignes.
+Instantané factuel du projet. Il est daté parce qu'il périme vite : le jalon 1 est
+en cours d'exécution au moment où ces lignes sont écrites.
 
-> **Instantané mouvant.** Le jalon 1 est en cours d'exécution automatisée au moment où ces
-> lignes sont écrites. Les faits ci-dessous proviennent du journal d'exécution
-> `.superpowers/sdd/2026-09-08-jalon-1-engine-docker/progress.md`, des rapports de tâche du
-> même répertoire, de l'historique git et de la lecture du code. La suite de tests n'a
-> **pas** été relancée pour l'occasion, afin de ne pas interférer avec l'exécution en
-> cours : les chiffres viennent des rapports de tâche.
->
-> Dernier commit observé : `e456139 fix(engine): spec_get distingue présence/absence et
-> champs falsy`.
+Pour le périmètre et la cible, voir [ROADMAP.md](ROADMAP.md). Pour qui fait quoi,
+voir [TEAM-SPLIT.md](TEAM-SPLIT.md).
+
+**Dernier commit relevé :** `aa9ec1f` — 20 commits depuis le début du jalon 1.
 
 ---
 
-## 1. En une phrase
+## En une phrase
 
-Le jalon 1 (engine bash : K3s → Docker, pipeline → dispatcher JSON) est à **7 tâches sur
-15**. Les fondations sont posées et testées — contrat de sortie, configuration JSON,
-dispatcher, lecture du spec — mais **aucune étape de déploiement Docker n'est encore
-écrite** : `engine/lib/steps.sh` contient toujours les étapes Kubernetes de l'ancien
-système. Rien n'est déployable en l'état.
+L'engine bash a quitté Kubernetes pour Docker Compose et sait maintenant exécuter
+une étape nommée à partir de paramètres JSON. Il reste huit tâches pour recâbler
+les étapes elles-mêmes. Rien du panneau Python n'existe encore.
 
 ---
 
-## 2. Le jalon 1 tâche par tâche
+## Ce qui marche aujourd'hui
 
-| # | Tâche | Statut | Trace |
-|---|---|---|---|
-| 1 | Réorganisation `engine/` + harnais de test | ✅ terminée | `73391fd..4776d04`, revue propre |
-| 2 | `lib/units.sh` — unités k8s → Docker | ✅ terminée | `4776d04..71536ab`, revue propre |
-| 3 | `lib/runtime.sh` — contrat de sortie, logs stderr | ✅ terminée | `71536ab..0bd9f95`, revue propre |
-| 4 | `lib/config.sh` — lecture JSON + `tools/migrate-env.sh` | ✅ terminée | `0bd9f95..04256a4`, revue propre |
-| 5 | `lib/ui.sh` — stderr, suppression des prompts | ✅ terminée | `04256a4..266f6f1`, propre après 2 rounds de correction |
-| 6 | Dispatcher `engine/bootstrap.sh` | ✅ terminée | `266f6f1..1009061`, propre après 3 rounds |
-| 7 | `spec.json` + helpers `spec_*` | 🟡 **en boucle de correction** | `db915ab` puis `e456139` ; 1 finding Important en cours |
-| 8 | `lib/gen_compose.sh` — génération du Compose | ⬜ non commencée | — |
-| 9 | `lib/gen_microservices.sh` — nginx non privilégié | ⬜ non commencée | — |
-| 10 | `lib/prepare_server.sh` — provisioning Docker | ⬜ non commencée | — |
-| 11 | `lib/steps.sh` — étapes réécrites | ⬜ non commencée | — |
-| 12 | Bloc GitHub optionnel + workflow Compose | ⬜ non commencée | — |
-| 13 | `lib/diag.sh` — diagnostic Docker | ⬜ non commencée | — |
-| 14 | `lib/gen_skills.sh` — Skills Docker | ⬜ non commencée | — |
-| 15 | Documentation + vérification des critères | ⬜ non commencée | produira `docs/ENGINE.md` et `docs/JALON-1-VERIFICATION.md` |
-
-**Sur la tâche 7** : l'implémentation est écrite, commitée et revue. La revue a validé la
-spécification et la sécurité (aucune tentative d'injection sur les identifiants de
-service, les noms de champs ou le contenu du spec n'aboutit), mais a levé un point
-Important — `spec_get` confondait un champ absent avec un champ valant explicitement
-`false` ou `""`. Le correctif est commité (`e456139`) ; le tour de revue suivant n'est pas
-encore consigné au journal.
-
----
-
-## 3. Ce qui existe et fonctionne
-
-### Le contrat de l'engine est en place et gardé par des tests
-
-`engine/bootstrap.sh` est un dispatcher : `--step`, `--all`, `--list-steps`, `--dry-run`.
-Le tableau `PIPELINE`, `run_pipeline`, `lib/state.sh`, `lib/collect.sh` et
-`lib/workspace.sh` ont disparu.
-
-`engine/lib/runtime.sh` fournit `emit_ok`, `emit_fail`, `die`, `retryable`,
-`install_error_trap` et `_runtime_begin_step`. Trois bugs réels du contrat ont été trouvés
-et corrigés pendant l'implémentation, chacun par un round de revue :
-
-1. Une variable non liée sous `set -u` sortait **sans aucune ligne JSON** — le `trap ERR`
-   ne voit pas ce cas. D'où le filet `trap EXIT` (`_exit_guard`), qui force un code 1
-   plutôt que le `0` trompeur que bash présente au trap dans cette situation.
-2. Le `trap ERR` pouvait produire une **deuxième** ligne JSON après un `emit_ok`.
-3. La garde anti-doublon était à l'échelle du **processus** au lieu de l'**étape** : en
-   mode `--all`, l'échec de toute étape suivant une étape ayant émis disparaissait de
-   stdout.
-
-### La configuration est du JSON, l'injection est fermée
-
-`cfg`, `cfg_req`, `cfg_bool`, `cfg_port` lisent `runs/<ws>/env.json` par `jq --arg`.
-`engine/tools/migrate-env.sh` convertit un ancien `.bootstrap-env` **sans le `source`**.
-Détail : `cfg_port` refuse tout port hors de `[1024, 65535]`, ce qui est vérifié par la
-fixture `env.min.json` qui contient volontairement un `ports.trop_bas: 80`.
-
-### Le spec d'application est lisible
-
-`spec_init`, `spec_service_ids`, `spec_get`, `spec_is_internal`, `spec_is_exposed`,
-`spec_exposed_ids_by_path_length`. `engine/templates/spec.demo.json` décrit l'app de démo
-(api Express + web nginx) ; `engine/tests/fixtures/spec.multi.json` ajoute un service `db`
-sur image tierce en `internal: true`.
-
-### Les conversions d'unités sont couvertes
-
-`k8s_cpu_to_docker` et `k8s_mem_to_docker` dans `engine/lib/units.sh`, avec le plancher de
-6 MiB imposé par Docker et le `LC_ALL=C` qui évite les virgules décimales en locale
-française.
-
-### Le provisioning n'installe plus rien à chaud
-
-`check_prereqs` est non interactif : il constate et échoue, il n'installe plus `gum`. Les
-vérifications conditionnelles sont correctes (`gh` seulement si `github.enabled`,
-`sshpass` seulement en authentification par mot de passe, `ssh-keygen` seulement si les
-deux conditions GitHub + clé sont réunies).
-
-### Suite de tests
-
-Au dernier point consigné (rapport de la tâche 7) :
-
-| Fichier | Assertions |
+| Capacité | État |
 |---|---|
-| `test_config.sh` | 27 ok |
-| `test_runtime.sh` | 18 ok |
-| `test_units.sh` | 15 ok |
-| `test_smoke.sh` | 4 ok |
-| **Total vert** | **64** |
-| `test_dispatcher.sh` | **12 sur 13** — la 13ᵉ est rouge exprès |
+| Exécuter une étape nommée (`--step`) | ✅ opérationnel |
+| Lister les étapes (`--list-steps`) | ✅ 16 étapes déclarées |
+| Lire la configuration en JSON (`env.json`) | ✅ plus aucun `source` |
+| Lire une spécification d'application (`spec.json`) | ✅ helpers `spec_*` |
+| Générer `deploy/compose.yml` depuis un spec | ✅ y compris volumes, services internes |
+| Convertir les unités Kubernetes → Docker | ✅ `200m`→`0.2`, `128Mi`→`128m` |
+| Contrat de sortie JSON + codes 0/1/2 | ✅ avec filet de sécurité |
+| Migrer un ancien `.bootstrap-env` | ✅ `engine/tools/migrate-env.sh` |
+| Harnais de test | ✅ 140 assertions |
 
-Plus, à chaque exécution de `engine/tests/run.sh` : `bash -n` sur tous les scripts de
-`engine/`, et `shellcheck --severity=error` **si shellcheck est installé** (sinon la
-vérification est sautée avec un message, sans faire échouer la suite).
+## Ce qui ne marche pas encore
+
+| Capacité | Bloqué par |
+|---|---|
+| Exécuter réellement un déploiement | tâche 11 (les `step_*` sont encore en version Kubernetes) |
+| Provisionner un serveur en Docker | tâche 10 |
+| Interface web | jalon 2 — `web/` est cassé et sera supprimé |
+| Multi-application, allocation de ports | jalon 3 |
+| Exposition derrière BunkerWeb | jalon 4 |
 
 ---
 
-## 4. Ce qui est cassé volontairement, et jusqu'à quand
+## Jalon 1, tâche par tâche
 
-| Quoi | Depuis | Jusqu'à | Pourquoi |
+| # | Tâche | État | Commits |
 |---|---|---|---|
-| **`web/`** (Flask) — `web/app.py:40` et `web/start.sh:33-35` pointent vers un `bootstrap.sh` à la racine qui n'y est plus | tâche 1 du jalon 1 | **jalon 2**, qui supprime `web/` entièrement | le déplacement sous `engine/` casse mécaniquement les chemins ; réparer une UI qui va disparaître serait du travail perdu |
-| **`engine/lib/steps.sh`** — contient encore les étapes Kubernetes (`step_fetch_kubeconfig`, `step_apply_initial_manifests`, `step_generate_manifests`, `kubectl`, `INGRESS_HOST`) et appelle `gum_box`, `C_GREEN_HEX`, `C_NAVY_HEX`, supprimés à la tâche 5 | tâche 5 | **tâche 11**, réécriture complète | réécrire un fichier deux fois n'a pas de valeur ; la tâche 11 le remplace intégralement |
-| **13ᵉ assertion de `test_dispatcher.sh`** (`--dry-run` sur `validate_ssh`) | tâche 6 | **tâche 11** | les étapes `step_*` n'existent pas encore ; c'est écrit dans le plan, ce n'est pas une régression |
-| **`engine/lib/gen_manifests.sh`** — le générateur Kubernetes est toujours sur disque | — | **tâche 8**, qui le supprime | il disparaît en même temps que son remplaçant `gen_compose.sh` apparaît |
-| **`engine/lib/ssh_remote.sh`** — lit encore `OVH_AUTH_METHOD`, `OVH_SSH_KEY_PATH`, `OVH_PASSWORD`, variables qui n'existent plus depuis la tâche 4 | tâche 4 | **tâche 11** | voir le point suivant : c'est une lacune du plan, pas un report délibéré |
+| 1 | Réorganisation `engine/` + harnais de test | ✅ terminée | `73391fd..4776d04` |
+| 2 | `lib/units.sh` — conversion des unités | ✅ terminée | `71536ab` |
+| 3 | `lib/runtime.sh` — contrat de sortie | ✅ terminée | `0bd9f95` |
+| 4 | `lib/config.sh` — configuration JSON | ✅ terminée | `04256a4` |
+| 5 | `lib/ui.sh` — stderr, suppression des prompts | ✅ terminée, 2 rounds | `47f70a5..266f6f1` |
+| 6 | Dispatcher `--step` | ✅ terminée, 3 rounds | `ae84d64..1009061` |
+| 7 | `spec.json` + helpers | ✅ terminée, 2 rounds | `db915ab..f3c233b` |
+| 8 | `lib/gen_compose.sh` | 🟡 correctif livré, re-revue en cours | `d355bac..aa9ec1f` |
+| 9 | `gen_microservices.sh` — nginx non privilégié | ⬜ à faire | |
+| 10 | `prepare_server.sh` — provisioning Docker | ⬜ à faire | |
+| 11 | `lib/steps.sh` — étapes réécrites | ⬜ à faire | |
+| 12 | Bloc GitHub optionnel + workflow | ⬜ à faire | |
+| 13 | `lib/diag.sh` — diagnostic Docker | ⬜ à faire | |
+| 14 | `gen_skills.sh` — Skills Docker | ⬜ à faire | |
+| 15 | Documentation + critères d'acceptation | ⬜ à faire | |
 
-### Le piège à ne pas rater à la tâche 11
-
-Le contrôleur a repéré, avant la tâche 6, que le plan de la tâche 11 se contente
-d'**ajouter** `docker_host_url` / `docker_remote` / `compose_remote` à `ssh_remote.sh`,
-et **oublie de convertir** les trois lectures `OVH_*` existantes vers
-`cfg target.auth_method`, `cfg target.ssh_key_path` et `cfg target.password`.
-
-Sans cette conversion, `ssh_remote` retombe **silencieusement** sur le mode clé avec un
-chemin de clé vide. C'est le type de panne qui produit un message SSH générique et coûte
-une demi-journée. À corriger explicitement dans la tâche 11.
-
-Deux autres pointeurs consignés pour la même tâche :
-
-- vérifier que le branchement `step_check_prereqs() { check_prereqs; }` existe bien (le
-  dispatcher cherche `step_check_prereqs`, `prereqs.sh` définit `check_prereqs`) ;
-- renforcer l'assertion n°11 de `test_dispatcher.sh`, qui ne compte que les lignes de
-  stdout et masquait ce bug : elle doit aussi vérifier `ok=true` ;
-- vérifier qu'aucun appel à `gum_box` ne survit à la réécriture de `steps.sh`.
+**7 tâches terminées sur 15.** Sept des huit restantes touchent des fichiers encore
+en version Kubernetes.
 
 ---
 
-## 5. Points reportés, avec leur justification
+## Tests
 
-Tous ces points sont consignés au journal d'exécution comme *deferred*. Aucun n'est un
-oubli : chacun a été vu, arbitré, et laissé de côté sciemment.
+```
+test_config          38 ok
+test_gen_compose     53 ok
+test_runtime         18 ok
+test_units           15 ok
+test_dispatcher      12 ok, 1 échec  ← volontaire, voir plus bas
+test_smoke            4 ok
+────────────────────────────
+                    140 assertions, 139 vertes
+```
 
-| Point | Où | Pourquoi c'est reporté |
-|---|---|---|
-| `cfg` renvoie un blob JSON multi-lignes si la valeur pointée est un objet ou un tableau | `lib/config.sh` (tâche 4) | aucun appelant actuel n'est concerné ; **pointeur explicite vers la tâche 8**, où `gen_compose` consomme `cfg` intensivement |
-| Idem pour `spec_get` sur un champ non scalaire | `lib/config.sh` (tâche 7) | même trappe, même raisonnement |
-| Aucun test automatisé ne couvre la **pureté stdout** des `ui_*` ni de `check_prereqs` | tâche 5 | l'invariant le plus sensible du projet n'a **aucune garde en régression** : seule la revue manuelle l'a vérifié. À trancher en revue finale du jalon — c'est le report le plus discutable de la liste |
-| `install_error_trap` est appelé **après** `config_init` : une erreur non-`die` survenant avant n'a ni `trap ERR` ni filet EXIT | `bootstrap.sh` (tâche 6) | défaut pré-existant, fenêtre étroite (validation du workspace et lecture d'`env.json`, qui échouent par `die`) |
-| `die` accepte un code de sortie non numérique (`die 'x' abc` → 255) | `lib/runtime.sh` (tâche 3) | aucun appelant prévu ne le fait ; ajouter une garde coûterait plus que le risque |
-| `LC_ALL=C` appliqué aussi à `printf` et `sed` alors que seul `awk` en a besoin | `lib/units.sh` (tâche 2) | bruit défensif, aucun comportement incorrect |
-| L'assertion « trois étapes qui réussissent → 3 lignes » de `test_runtime.sh` survit à la mutation qu'elle est censée détecter | tâche 6 | elle est décorative **pour ce bug précis** ; les trois autres assertions font le travail. À reformuler ou à nuancer en commentaire |
-| `assert_not_contains` n'a pas de commentaire de signature | `tests/helpers.sh` (tâche 1) | cosmétique |
+Plus, à chaque exécution : `bash -n` sur tous les scripts et `shellcheck --severity=error`.
 
-### Arbitrages rendus en cours de route
-
-Trois décisions ont modifié la lecture du plan et méritent d'être connues :
-
-1. **Le `trap ERR` produit un code 1, pas un code 2.** Le texte du plan disait
-   « `install_error_trap` → `trap ERR` qui appelle `die` » ; le code fait `emit_fail` puis
-   `exit 1`. **Le code a raison** : une commande qui échoue de façon inattendue doit être
-   réessayable. Les échecs fatals passent par un appel explicite à `die`, que le `trap ERR`
-   n'intercepte pas (`exit` ne déclenche pas `ERR`). Aucune tâche suivante ne doit se fier
-   à la formulation du plan.
-2. **La regex de workspace l'emporte sur les fixtures.** Le workspace de test
-   `_test_dispatch` était refusé par la règle du premier caractère alphanumérique. La
-   fixture a été renommée en `test-dispatch` : c'est le contrôle de sécurité qui ferme la
-   traversée de chemin, et les slugs du panel (jalon 2) commenceront eux aussi par une
-   lettre.
-3. **`ssh-keygen` a été ajouté aux prérequis conditionnels.** Le plan l'avait omis alors
-   que le bloc GitHub l'utilise — lacune du brief, pas déviation de l'implémenteur.
-
-### Bugs du plan corrigés par l'implémentation
-
-- `engine/tests/run.sh` plantait sur un glob non résolu (`engine/tools/*.sh` tant que le
-  répertoire était vide) ; une garde `[[ -f ]]` a été ajoutée.
-- La locale `fr_FR` faisait produire `0,200` à `awk` au lieu de `0.200`. Reproduit par le
-  relecteur, corrigé par `LC_ALL=C`.
-- Deux coquilles de comptage dans le plan (« 13 assertions » pour 15, « 4 Skills » pour 5).
+Lancer : `bash engine/tests/run.sh` (ou `bash engine/tests/run.sh test_config` pour
+une seule suite). Voir [CONVENTIONS.md](CONVENTIONS.md) pour le harnais.
 
 ---
 
-## 6. Ce qui n'a pas pu être vérifié
+## Ce qui est cassé volontairement
 
-**Aucune cible SSH de test n'est disponible.** C'est une contrainte connue et actée avant
-même la rédaction du plan, pas une découverte tardive.
+Trois choses sont dans un état intermédiaire assumé. Ne les « réparez » pas.
 
-Conséquence directe : le **critère d'acceptation n°6 du jalon 1** — « `--all` avec
-`spec.demo.json` déploie l'app de démo de bout en bout sur une cible SSH de test » — **ne
-sera pas validé dans ce jalon**. Il est remplacé par un `--dry-run` qui imprime les
-commandes distantes sans les exécuter, et la tâche 15 doit le déclarer explicitement dans
-`docs/JALON-1-VERIFICATION.md`.
+**`web/`** — l'interface Flask ne fonctionne plus depuis que `bootstrap.sh` a
+déménagé sous `engine/`. Elle est supprimée au jalon 2 et remplacée par le panneau
+FastAPI. Rien à faire d'ici là.
 
-Ce qui sera vérifié à la place :
+**`engine/lib/steps.sh`** — encore en version Kubernetes. Il référence
+`gen_manifests.sh` (supprimé), appelle `gum_box` (supprimé) et contient trois
+`ui_confirm` interactifs qui bloqueraient un worker sans TTY. La tâche 11 le
+réécrit intégralement.
 
-- `--all --dry-run` traverse les seize étapes sans erreur, chacune imprimant une ligne
-  `ok:true` ;
-- les étapes de génération tournent réellement et produisent un `compose.yml` accepté par
-  `docker compose config --quiet`.
-
-Ce qui restera à vérifier dès qu'une cible existera, dans cet ordre :
-
-1. `validate_ssh` — la connexion effective ;
-2. `prepare_server` — l'installation de Docker sur une Ubuntu vierge ;
-3. **`build_images` — `DOCKER_HOST=ssh://` et le transfert du contexte de build.
-   C'est le point le plus incertain de tout le jalon** : ce mécanisme n'a jamais été
-   exercé ici ;
-4. `deploy_stack` — le démarrage réel des conteneurs ;
-5. `validate_deployment` — les healthchecks et les `curl` locaux sur la cible.
-
-Deux autres inconnues, plus loin dans la feuille de route, sont signalées comme « à
-confirmer sur une app de test plutôt qu'à supposer » :
-
-- **Jalon 4** : le `/` final sur `REVERSE_PROXY_HOST_1` est censé retirer le préfixe
-  `/api`, comme un `proxy_pass` NGINX classique. Le comportement réel doit être confirmé.
-- **Jalon 3** : l'IP source vue par l'hôte cible est-elle bien celle de BunkerWeb ? Si
-  BunkerWeb sort derrière un NAT ou un bridge Docker, la règle ufw ne matchera pas.
+**La 13e assertion de `test_dispatcher`** — « `--dry-run` réussit sans rien faire »
+échoue parce qu'elle exécute réellement une étape, et que `steps.sh` est encore
+l'ancienne version (variable `OVH_USER` non liée). Elle passera au vert à la
+tâche 11. C'est le seul échec attendu de la suite ; tout autre échec est un vrai
+problème.
 
 ---
 
-## 7. Ce qui n'a même pas commencé
+## Ce qui a été trouvé en route
 
-Les jalons 2 à 6 sont intégralement devant nous : il n'existe **aucune ligne de Python**
-dans le répertoire `panel/` — le répertoire lui-même n'existe pas — ni de `compose.yml` à
-la racine, ni de client BunkerWeb, ni d'allocateur de ports, ni d'intégration LLM, ni de
-scanners dans le chemin du panneau.
+Les revues ont attrapé des choses qui n'étaient pas dans le plan. Elles valent
+d'être connues.
 
-Le `README.md` de la racine décrit encore, en détail et avec assurance, le système
-Kubernetes d'avant. **Il est périmé** ; sa réécriture est la tâche 15 du jalon 1.
+**Une injection YAML dans le générateur de Compose.** `jq --arg` empêche
+l'exécution de commandes shell, mais pas la corruption de la structure YAML. Un
+volume valant `normal:/data\n    privileged: true` faisait apparaître
+`privileged: true` comme clé de service — et Compose l'acceptait. Les trois
+« interdits absolus » du projet (`privileged`, `network_mode`, socket Docker)
+étaient contournables par le contenu d'un `spec.json`. C'est grave parce qu'au
+jalon 5 ces specs seront produits par un LLM à partir d'un prompt utilisateur.
+Corrigé : l'échappement est délégué à `jq`, et `spec_init` valide les identifiants
+de service.
+
+**L'engine pouvait sortir sans aucune ligne JSON.** Une variable non liée sous
+`set -u` ne déclenche pas le trap `ERR`, seulement `EXIT` — l'engine mourait en
+silence et le worker n'aurait rien eu à parser. Corrigé par un filet sur `EXIT` qui
+n'émet que si rien n'a été émis, en préservant le code de sortie.
+
+**La ligne JSON d'échec partait dans le fichier généré.** La redirection
+`{ … } > compose.yml` détournait la sortie standard pendant toute la génération :
+un échec en cours de route écrivait son JSON **dans le compose.yml** au lieu de
+stdout. Corrigé par un descripteur dédié.
+
+**Un `compose.yml` tronqué restait sur disque** quand la génération échouait à
+mi-parcours. Corrigé par écriture atomique.
+
+**La locale française cassait la conversion des unités.** `awk` produisait `0,200`
+au lieu de `0.200`. Corrigé par `LC_ALL=C`.
 
 ---
 
-## 8. Documents liés
+## Points reportés
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — ce qu'on construit et pourquoi.
-- [`CONVENTIONS.md`](CONVENTIONS.md) — comment contribuer sans casser les contrats.
-- [`SECURITY.md`](SECURITY.md) — ce qui est protégé et ce qui ne l'est pas encore.
-- [`TEAM-SPLIT.md`](TEAM-SPLIT.md) — qui prend quoi à partir de maintenant.
-- [`ROADMAP.md`](ROADMAP.md) — le périmètre des six jalons.
+Aucun n'est bloquant. Ils seront triés à la revue finale du jalon.
+
+| Point | Où |
+|---|---|
+| `die` accepte un code non numérique et sort alors en 255 | `lib/runtime.sh` |
+| `cfg` et `spec_get` renvoient un blob JSON si la valeur est un objet ou un tableau | `lib/config.sh` |
+| Aucun test ne couvre la pureté stdout des `ui_*` — seule la revue manuelle l'a vérifiée | `lib/ui.sh` |
+| Le critère des deux squelettes Compose est « pas de `build` », pas « `internal` » | `lib/gen_compose.sh` |
+| `install_error_trap` est posé après `config_init` : une erreur avant n'a pas de filet | `bootstrap.sh` |
+| Une assertion de `test_runtime` survit à la mutation, elle est décorative | `tests/test_runtime.sh` |
+
+---
+
+## Deux pièges qui attendent les tâches suivantes
+
+**`engine/lib/ssh_remote.sh` lit encore `OVH_AUTH_METHOD`, `OVH_SSH_KEY_PATH` et
+`OVH_PASSWORD`.** Ces variables n'existent plus depuis le passage à `env.json`. Le
+plan de la tâche 11 n'avait pas prévu de les convertir vers `cfg target.*`. La
+panne serait **silencieuse** : repli sur le mode clé avec un chemin vide. À traiter
+à la tâche 11.
+
+**Le token de registre transitait par la ligne de commande SSH.** Visible dans `ps`
+sur la machine cible pendant tout le provisioning, et cassé par un token contenant
+une apostrophe. Le plan a été corrigé : utilisateur et token passent par stdin, en
+deux lignes avant le corps du script. Les tâches 10 et 11 doivent implémenter cette
+version-là.
+
+---
+
+## Ce qui n'a pas pu être vérifié
+
+**Aucune cible SSH de test n'est disponible.** Le critère d'acceptation n°6 du
+jalon 1 — `--all` déploie l'application de démonstration de bout en bout — ne sera
+pas validé dans ce jalon. Ce qui sera vérifié à la place : `--all --dry-run`
+traverse les seize étapes, et les générateurs produisent un `compose.yml` que
+`docker compose config --quiet` accepte.
+
+Cinq choses restent à exercer dès qu'une cible existe, dans cet ordre :
+`validate_ssh`, `prepare_server` sur une Ubuntu vierge, `build_images` via
+`DOCKER_HOST=ssh://`, `deploy_stack`, `validate_deployment`. Le point le plus
+incertain est le troisième : `docker compose build` à travers `DOCKER_HOST=ssh://`
+transfère le contexte de build par SSH, et ça n'a jamais été exercé ici.
+
+**Docker Desktop doit tourner** pour que `test_gen_compose` exécute ses assertions
+`docker compose config`. Le démon est actif au moment de cet instantané (serveur
+29.5.3, Compose v5.1.4). S'il est éteint, la suite saute ces assertions et le dit —
+elle ne bloque plus, mais le critère d'acceptation n°7 n'est alors pas exercé.
+
+---
+
+## Documents liés
+
+- [ROADMAP.md](ROADMAP.md) — les 6 jalons
+- [TEAM-SPLIT.md](TEAM-SPLIT.md) — répartition entre les trois rôles
+- [ARCHITECTURE.md](ARCHITECTURE.md) — contrat engine, topologie, formats
+- [SECURITY.md](SECURITY.md) — modèle de sécurité
+- [CONVENTIONS.md](CONVENTIONS.md) — bash 3.2, tests, invariants
+- `docs/superpowers/plans/2026-09-08-jalon-1-engine-docker.md` — le plan détaillé
