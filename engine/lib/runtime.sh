@@ -56,7 +56,13 @@ error_handler() {
   local cmd="$2"
   ui_err "Échec dans '${_CURRENT_STEP:-<engine>}' (ligne ${line}, exit=${exit_code})"
   ui_err "Commande : ${cmd}"
-  emit_fail "étape '${_CURRENT_STEP:-inconnue}' : ${cmd} (ligne ${line}, exit ${exit_code})"
+  # Même garde que _exit_guard : si une ligne de résultat a déjà été émise
+  # (ex. emit_ok suivi d'une commande qui échoue plus loin dans la même
+  # étape), on ne double-imprime jamais sur stdout. Le diagnostic ci-dessus
+  # part quand même sur stderr — c'est stdout qui doit rester intact.
+  if [[ "$_RESULT_EMITTED" -ne 1 ]]; then
+    emit_fail "étape '${_CURRENT_STEP:-inconnue}' : ${cmd} (ligne ${line}, exit ${exit_code})"
+  fi
   exit 1
 }
 
