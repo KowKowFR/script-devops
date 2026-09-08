@@ -36,10 +36,10 @@ check_prereqs() {
       ui_err "gh manquant alors que github.enabled=true"
       missing+=("gh")
     fi
+    (( count++ ))
   else
     ui_skip "gh non vérifié (github.enabled=false)"
   fi
-  (( count++ ))
 
   # sshpass n'est requis qu'en authentification par mot de passe.
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
@@ -49,8 +49,8 @@ check_prereqs() {
       ui_err "sshpass manquant alors que target.auth_method=password"
       missing+=("sshpass")
     fi
+    (( count++ ))
   fi
-  (( count++ ))
 
   # ssh-keygen n'est requis que si GitHub est activé ET qu'on utilise une clé SSH.
   if cfg_bool github.enabled && [[ "$(cfg target.auth_method key)" == "key" ]]; then
@@ -60,10 +60,10 @@ check_prereqs() {
       ui_err "ssh-keygen manquant alors que github.enabled=true et target.auth_method=key"
       missing+=("ssh-keygen")
     fi
+    (( count++ ))
   else
     ui_skip "ssh-keygen non vérifié (github.enabled=false ou target.auth_method!=key)"
   fi
-  (( count++ ))
 
   if (( ${#missing[@]} > 0 )); then
     die "outils manquants : ${missing[*]}" 2
