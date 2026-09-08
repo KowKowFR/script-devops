@@ -376,7 +376,7 @@ assert_eq "128m" "$(k8s_mem_to_docker 128Mi)" "128Mi → 128m"
 assert_eq "1024m" "$(k8s_mem_to_docker 1Gi)"  "1Gi → 1024m"
 assert_eq "64m"  "$(k8s_mem_to_docker 65536Ki)" "65536Ki → 64m"
 assert_eq "512m" "$(k8s_mem_to_docker 512m)"  "512m (déjà Docker) → inchangé"
-assert_eq "256m" "$(k8s_mem_to_docker 256M)"  "256M décimal → 256m (arrondi MiB)"
+assert_eq "244m" "$(k8s_mem_to_docker 256M)"  "256M décimal → 244m (256 Mo = 244 MiB)"
 assert_exit_code 1 "mémoire vide rejetée" -- k8s_mem_to_docker ""
 assert_exit_code 1 "mémoire non numérique rejetée" -- k8s_mem_to_docker "plein"
 
@@ -417,7 +417,7 @@ k8s_cpu_to_docker() {
     local milli="${BASH_REMATCH[1]}"
     local out
     out=$(awk -v m="$milli" 'BEGIN { printf "%.3f", m / 1000 }')
-    out="${out%%+(0)}"          # ne fonctionne qu'avec extglob : on fait autrement
+    # Nettoyage des zéros de queue : 0.200 → 0.2, 2.000 → 2
     out=$(printf '%s' "$out" | sed -e 's/0*$//' -e 's/\.$//')
     printf '%s' "$out"
     return 0
@@ -459,15 +459,13 @@ k8s_mem_to_docker() {
 }
 ```
 
-Note : la ligne `out="${out%%+(0)}"` est un vestige à supprimer — `extglob` n'est pas activé et cette substitution ne ferait rien. Le `sed` qui suit fait le travail. **Supprimer cette ligne** en écrivant le fichier.
-
 - [ ] **Step 4: Lancer le test et vérifier qu'il passe**
 
 ```bash
 bash engine/tests/run.sh test_units
 ```
 
-Attendu : 13 assertions ok. Si `256M → 256m` échoue, vérifier le calcul : `256 * 1000000 / 1048576 = 244`. **Corriger le test à `244m`**, pas l'implémentation : la conversion décimale→binaire est mathématiquement correcte, c'est l'attente qui était fausse.
+Attendu : 13 assertions ok. Ne modifier aucune assertion pour la faire passer : si une conversion diverge, c'est l'implémentation qui a tort. (`256M` vaut bien `244m` : `256 × 10⁶ ÷ 2²⁰ = 244`.)
 
 - [ ] **Step 5: Commit**
 
