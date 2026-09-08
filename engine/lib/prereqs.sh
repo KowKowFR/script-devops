@@ -7,7 +7,7 @@
 
 check_prereqs() {
   local required=("git" "ssh" "scp" "curl" "jq" "docker")
-  local missing=() tool
+  local missing=() tool count=0
 
   for tool in "${required[@]}"; do
     if command -v "$tool" >/dev/null 2>&1; then
@@ -16,6 +16,7 @@ check_prereqs() {
       ui_err "${tool} manquant (requis)"
       missing+=("$tool")
     fi
+    (( count++ ))
   done
 
   # docker compose est un plugin, pas un binaire du PATH.
@@ -25,6 +26,7 @@ check_prereqs() {
     ui_err "plugin 'docker compose' manquant (requis)"
     missing+=("docker-compose-plugin")
   fi
+  (( count++ ))
 
   # gh n'est requis que si le bloc GitHub est activé.
   if cfg_bool github.enabled; then
@@ -37,6 +39,7 @@ check_prereqs() {
   else
     ui_skip "gh non vérifié (github.enabled=false)"
   fi
+  (( count++ ))
 
   # sshpass n'est requis qu'en authentification par mot de passe.
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
@@ -47,10 +50,24 @@ check_prereqs() {
       missing+=("sshpass")
     fi
   fi
+  (( count++ ))
+
+  # ssh-keygen n'est requis que si GitHub est activé ET qu'on utilise une clé SSH.
+  if cfg_bool github.enabled && [[ "$(cfg target.auth_method key)" == "key" ]]; then
+    if command -v ssh-keygen >/dev/null 2>&1; then
+      ui_ok "ssh-keygen présent (github.enabled=true ET target.auth_method=key)"
+    else
+      ui_err "ssh-keygen manquant alors que github.enabled=true et target.auth_method=key"
+      missing+=("ssh-keygen")
+    fi
+  else
+    ui_skip "ssh-keygen non vérifié (github.enabled=false ou target.auth_method!=key)"
+  fi
+  (( count++ ))
 
   if (( ${#missing[@]} > 0 )); then
     die "outils manquants : ${missing[*]}" 2
   fi
 
-  emit_ok "$(jq -cn --argjson n "${#required[@]}" '{checked: $n}')"
+  emit_ok "$(jq -cn --argjson n "$count" '{checked: $n}')"
 }
