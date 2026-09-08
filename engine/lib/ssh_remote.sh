@@ -14,6 +14,13 @@
 # une panne SILENCIEUSE : repli sur le mode clé avec un chemin de clé vide,
 # `ssh -i ''` échouant loin de la cause réelle.
 #
+# Port : target.port (optionnel, défaut 22) — une cible qui n'expose pas le
+# 22 (ex. VM locale type Lima, bind sur un port non privilégié) n'a sinon
+# aucun moyen d'être jointe sans passer par un ~/.ssh/config bricolé à la
+# main. `ssh`/`ssh -t` attendent `-p` (minuscule), `scp` attend `-P`
+# (majuscule) : piège classique, vérifié explicitement dans chaque fonction
+# ci-dessous plutôt que factorisé dans un flag partagé.
+#
 # Trois entrées (toutes prennent les mêmes args que ssh/scp) :
 #   ssh_remote      [args...] user@host "cmd"   — usage standard non-interactif
 #   ssh_remote_tty  [args...] user@host         — TTY alloué (heredoc avec input)
@@ -27,11 +34,19 @@ _ssh_password_opts=(
   -o PubkeyAuthentication=no
 )
 
+# _target_port — port SSH de la cible, tel que déclaré dans env.json
+# (target.port), 22 par défaut.
+_target_port() {
+  cfg target.port 22
+}
+
 ssh_remote() {
+  local port; port="$(_target_port)"
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
-    SSHPASS="$(cfg target.password)" sshpass -e ssh "${_ssh_password_opts[@]}" "$@"
+    SSHPASS="$(cfg target.password)" sshpass -e ssh -p "$port" "${_ssh_password_opts[@]}" "$@"
   else
     ssh -i "$(cfg_req target.ssh_key_path)" \
+        -p "$port" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
         "$@"
@@ -40,20 +55,24 @@ ssh_remote() {
 
 ssh_remote_tty() {
   # Identique à ssh_remote, mais alloue un TTY.
+  local port; port="$(_target_port)"
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
-    SSHPASS="$(cfg target.password)" sshpass -e ssh -t "${_ssh_password_opts[@]}" "$@"
+    SSHPASS="$(cfg target.password)" sshpass -e ssh -t -p "$port" "${_ssh_password_opts[@]}" "$@"
   else
     ssh -t -i "$(cfg_req target.ssh_key_path)" \
+        -p "$port" \
         -o StrictHostKeyChecking=accept-new \
         "$@"
   fi
 }
 
 scp_remote() {
+  local port; port="$(_target_port)"
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
-    SSHPASS="$(cfg target.password)" sshpass -e scp "${_ssh_password_opts[@]}" "$@"
+    SSHPASS="$(cfg target.password)" sshpass -e scp -P "$port" "${_ssh_password_opts[@]}" "$@"
   else
     scp -i "$(cfg_req target.ssh_key_path)" \
+        -P "$port" \
         -o StrictHostKeyChecking=accept-new \
         "$@"
   fi
@@ -65,7 +84,7 @@ scp_remote() {
 # une autre. Un seul chemin de code, aucune exception.
 
 docker_host_url() {
-  printf 'ssh://%s@%s' "$(cfg_req target.user)" "$(cfg_req target.host)"
+  printf 'ssh://%s@%s:%s' "$(cfg_req target.user)" "$(cfg_req target.host)" "$(_target_port)"
 }
 
 # _docker_mutating_action ACTION — code 0 si ACTION modifie l'état de la
