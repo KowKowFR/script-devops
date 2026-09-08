@@ -1,62 +1,12 @@
 #!/usr/bin/env bash
-# lib/prereqs.sh — Détection/installation de gum + vérification des pré-requis.
+# engine/lib/prereqs.sh — vérification des outils requis côté engine.
+#
+# Non-interactif : aucune installation, aucun prompt. L'engine tourne dans un
+# conteneur worker (jalon 2) où l'image apporte ses dépendances ; si un outil
+# manque, c'est une erreur de build d'image, pas quelque chose à réparer à chaud.
 
-# ----- Détection / installation de gum --------------------------------------
-ensure_gum() {
-  if command -v gum >/dev/null 2>&1; then
-    HAS_GUM=1
-    return 0
-  fi
-
-  echo
-  printf "%b\n" "${C_YELLOW}⚠${C_RESET}  gum n'est pas installé (TUI dégradée)."
-  echo "    gum est un petit outil TUI (charm.sh/gum) qui rend les prompts beaucoup plus agréables."
-  echo
-
-  if [[ "${BOOTSTRAP_NONINTERACTIVE:-0}" == "1" ]]; then
-    printf "%b\n" "${C_DIM}Mode non-interactif : on continue sans gum.${C_RESET}"
-    return 0
-  fi
-
-  local installer=""
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    installer="brew install gum"
-  elif command -v apt >/dev/null 2>&1; then
-    installer="sudo mkdir -p /etc/apt/keyrings && curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg && echo 'deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *' | sudo tee /etc/apt/sources.list.d/charm.list && sudo apt update && sudo apt install -y gum"
-  fi
-
-  if [[ -z "$installer" ]]; then
-    echo "    Installation manuelle : https://github.com/charmbracelet/gum#installation"
-    return 0
-  fi
-
-  read -r -p "Installer gum maintenant ? [Y/n] " ans
-  ans="${ans:-y}"
-  ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')
-  if [[ "$ans" != "y" && "$ans" != "yes" && "$ans" != "o" ]]; then
-    return 0
-  fi
-
-  eval "$installer"
-  if command -v gum >/dev/null 2>&1; then
-    HAS_GUM=1
-    printf "%b\n" "${C_GREEN}✓${C_RESET}  gum installé"
-  else
-    printf "%b\n" "${C_RED}✗${C_RESET}  Installation de gum échouée, fallback texte."
-  fi
-}
-
-# ----- Vérification des pré-requis CLI --------------------------------------
 check_prereqs() {
-  ui_step "Vérification des pré-requis"
-
-  if state_has "prereqs_checked"; then
-    ui_skip "Pré-requis déjà validés"
-    return 0
-  fi
-
-  local required=("git" "gh" "ssh" "ssh-keygen" "curl" "jq")
-  local optional=("docker" "claude" "kubectl" "gum")
+  local required=("git" "ssh" "scp" "curl" "jq" "docker")
   local missing=() tool
 
   for tool in "${required[@]}"; do
@@ -68,53 +18,39 @@ check_prereqs() {
     fi
   done
 
-  for tool in "${optional[@]}"; do
-    if command -v "$tool" >/dev/null 2>&1; then
-      ui_ok "${tool} présent"
+  # docker compose est un plugin, pas un binaire du PATH.
+  if docker compose version >/dev/null 2>&1; then
+    ui_ok "docker compose présent"
+  else
+    ui_err "plugin 'docker compose' manquant (requis)"
+    missing+=("docker-compose-plugin")
+  fi
+
+  # gh n'est requis que si le bloc GitHub est activé.
+  if cfg_bool github.enabled; then
+    if command -v gh >/dev/null 2>&1; then
+      ui_ok "gh présent (github.enabled=true)"
     else
-      ui_warn "${tool} manquant (optionnel mais recommandé)"
+      ui_err "gh manquant alors que github.enabled=true"
+      missing+=("gh")
     fi
-  done
+  else
+    ui_skip "gh non vérifié (github.enabled=false)"
+  fi
+
+  # sshpass n'est requis qu'en authentification par mot de passe.
+  if [[ "$(cfg target.auth_method key)" == "password" ]]; then
+    if command -v sshpass >/dev/null 2>&1; then
+      ui_ok "sshpass présent (auth par mot de passe)"
+    else
+      ui_err "sshpass manquant alors que target.auth_method=password"
+      missing+=("sshpass")
+    fi
+  fi
 
   if (( ${#missing[@]} > 0 )); then
-    ui_err "Outils manquants : ${missing[*]}"
-    echo
-    echo "Installation suggérée :"
-    echo "  macOS  : brew install ${missing[*]}"
-    echo "  Linux  : sudo apt install ${missing[*]}"
-    exit 1
+    die "outils manquants : ${missing[*]}" 2
   fi
 
-  if ! gh auth status >/dev/null 2>&1; then
-    ui_warn "GitHub CLI non authentifié"
-    ui_info "Lancement de 'gh auth login'…"
-    gh auth login
-  fi
-  ui_ok "GitHub CLI authentifié"
-
-  state_mark "prereqs_checked"
-}
-
-# ----- Installation de sshpass (mode password) ------------------------------
-ensure_sshpass() {
-  command -v sshpass >/dev/null 2>&1 && return 0
-
-  ui_warn "sshpass n'est pas installé — requis pour l'auth par mot de passe"
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-    ui_info "Installation : brew install hudochenkov/sshpass/sshpass"
-    if ui_confirm "Installer sshpass maintenant ?"; then
-      brew install hudochenkov/sshpass/sshpass
-      return 0
-    fi
-    ui_err "sshpass requis pour continuer en mode password"
-    exit 1
-  fi
-
-  if command -v apt >/dev/null 2>&1; then
-    sudo apt install -y sshpass
-    return 0
-  fi
-
-  ui_err "Installe sshpass manuellement puis relance"
-  exit 1
+  emit_ok "$(jq -cn --argjson n "${#required[@]}" '{checked: $n}')"
 }
