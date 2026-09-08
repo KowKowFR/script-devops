@@ -260,7 +260,7 @@ EOF
   cat > "$WORK_DIR/README.md" <<EOF
 # ${APP_NAME} — chaîne IA-pilotée
 
-> Application microservices déployée sur Kubernetes (k3s), pipeline CI/CD GitHub Actions, pilotée en langage naturel via 4 Skills Claude Code custom.
+> Application microservices déployée via Docker Compose, pipeline CI/CD GitHub Actions, pilotée en langage naturel via 5 Skills Claude Code custom.
 
 ## Quickstart
 
@@ -279,10 +279,10 @@ claude
 ├── services/
 │   ├── api/         # Express.js — port ${api_port} — endpoints /, /health, /info
 │   └── web/         # nginx (non privilégié) + HTML statique — port ${web_port}
-├── k8s/base/        # Manifests Kubernetes (deployments + ingress)
+├── deploy/          # compose.yml + .env (IMAGE_TAG piloté par le CI)
 ├── .github/workflows/
 │   └── deploy.yml   # Pipeline CI/CD : build → push → deploy
-└── .agents/skills/  # 4 Skills Claude Code custom
+└── .agents/skills/  # 5 Skills Claude Code custom
 \`\`\`
 
 ## Endpoints
