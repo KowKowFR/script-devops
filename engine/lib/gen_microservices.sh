@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
-# lib/gen_microservices.sh
-# Génère les microservices API (Express) et Web (nginx) avec leurs Dockerfiles.
+# engine/lib/gen_microservices.sh — génère les sources de l'application de démo.
 #
-# Usage : gen_microservices.sh WORK_DIR APP_AUTHOR
+# Sourcé par lib/steps.sh (plus exécuté en sous-processus : il a besoin des
+# helpers spec_*/cfg_*).
 #
-# Variables d'environnement (avec valeurs par défaut) :
-#   APP_NAME (tp-app), APP_PORT (80), API_PORT (3000)
+# Écrit dans $WORK_DIR/services/<id>/ — le chemin correspond au "build" du
+# spec ("./services/api"). L'ancien répertoire microservices/ disparaît.
 
-set -euo pipefail
+gen_microservices() {
+  spec_init
 
-WORK_DIR="${1:?WORK_DIR required}"
-APP_AUTHOR="${2:?APP_AUTHOR required}"
+  local author; author="$(cfg app.author "$APP_NAME")"
+  local api_port; api_port="$(spec_get api port 3000)"
+  local web_port; web_port="$(spec_get web port 8080)"
 
-APP_NAME="${APP_NAME:-tp-app}"
-APP_PORT="${APP_PORT:-80}"
-API_PORT="${API_PORT:-3000}"
+  mkdir -p "$WORK_DIR/services/api" "$WORK_DIR/services/web"
 
-mkdir -p "$WORK_DIR/microservices/api"
-mkdir -p "$WORK_DIR/microservices/web"
-
-# ----- API Express ----------------------------------------------------------
-cat > "$WORK_DIR/microservices/api/package.json" <<EOF
+  # ----- API Express ---------------------------------------------------------
+  cat > "$WORK_DIR/services/api/package.json" <<EOF
 {
   "name": "${APP_NAME}-api",
   "version": "1.0.0",
@@ -29,7 +26,7 @@ cat > "$WORK_DIR/microservices/api/package.json" <<EOF
   "scripts": {
     "start": "node server.js"
   },
-  "author": "${APP_AUTHOR}",
+  "author": "${author}",
   "license": "MIT",
   "dependencies": {
     "express": "^4.19.2"
@@ -37,13 +34,13 @@ cat > "$WORK_DIR/microservices/api/package.json" <<EOF
 }
 EOF
 
-cat > "$WORK_DIR/microservices/api/server.js" <<EOF
+  cat > "$WORK_DIR/services/api/server.js" <<EOF
 const express = require('express');
 const app = express();
-const PORT = process.env.PORT || ${API_PORT};
+const PORT = process.env.PORT || ${api_port};
 
 const APP_NAME = '${APP_NAME}-api';
-const APP_AUTHOR = '${APP_AUTHOR}';
+const APP_AUTHOR = '${author}';
 const APP_VERSION = process.env.APP_VERSION || '1.0.0';
 const DEPLOYED_AT = new Date().toISOString();
 
@@ -78,7 +75,7 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 EOF
 
-cat > "$WORK_DIR/microservices/api/Dockerfile" <<EOF
+  cat > "$WORK_DIR/services/api/Dockerfile" <<EOF
 # Image minimale Alpine pour réduire la surface d'attaque
 FROM node:20-alpine
 
@@ -89,14 +86,14 @@ RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 
 COPY server.js ./
 
-EXPOSE ${API_PORT}
+EXPOSE ${api_port}
 
 USER node
 
 CMD ["node", "server.js"]
 EOF
 
-cat > "$WORK_DIR/microservices/api/.dockerignore" <<'EOF'
+  cat > "$WORK_DIR/services/api/.dockerignore" <<'EOF'
 node_modules
 npm-debug.log
 .git
@@ -104,12 +101,13 @@ npm-debug.log
 README.md
 EOF
 
-# ----- Web (nginx + HTML statique) ------------------------------------------
-# Configuration nginx si APP_PORT != 80
-if [[ "$APP_PORT" != "80" ]]; then
-  cat > "$WORK_DIR/microservices/web/nginx.conf" <<EOF
+  # ----- Web (nginx-unprivileged + HTML statique) -----------------------------
+  # nginx-unprivileged écoute sur 8080 et tourne en uid 101 sans root. C'est
+  # ce qui permet le user non-root et le read_only du compose ; nginx:alpine
+  # voulait binder le port 80, impossible sans privilège.
+  cat > "$WORK_DIR/services/web/nginx.conf" <<EOF
 server {
-    listen       ${APP_PORT};
+    listen       ${web_port};
     server_name  _;
     root         /usr/share/nginx/html;
     index        index.html;
@@ -118,15 +116,14 @@ server {
     }
 }
 EOF
-fi
 
-cat > "$WORK_DIR/microservices/web/index.html" <<EOF
+  cat > "$WORK_DIR/services/web/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TP DevSecOps — ${APP_AUTHOR}</title>
+  <title>TP DevSecOps — ${author}</title>
   <style>
     :root {
       --navy: #1E2761;
@@ -218,9 +215,9 @@ cat > "$WORK_DIR/microservices/web/index.html" <<EOF
     <p>Chaîne automatisée pilotée en langage naturel par un agent IA. Cette page est servie par nginx dans un pod Kubernetes, derrière un ingress Traefik.</p>
 
     <div class="grid">
-      <div class="stat"><strong>Auteur</strong><span>${APP_AUTHOR}</span></div>
+      <div class="stat"><strong>Auteur</strong><span>${author}</span></div>
       <div class="stat"><strong>App</strong><span>${APP_NAME}</span></div>
-      <div class="stat"><strong>Frontend</strong><span>nginx:alpine</span></div>
+      <div class="stat"><strong>Frontend</strong><span>nginx-unprivileged:alpine</span></div>
       <div class="stat"><strong>Backend</strong><span>node:20-alpine</span></div>
     </div>
 
@@ -252,23 +249,15 @@ cat > "$WORK_DIR/microservices/web/index.html" <<EOF
 </html>
 EOF
 
-if [[ "$APP_PORT" != "80" ]]; then
-  cat > "$WORK_DIR/microservices/web/Dockerfile" <<EOF
-FROM nginx:alpine
+  cat > "$WORK_DIR/services/web/Dockerfile" <<EOF
+FROM nginxinc/nginx-unprivileged:alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY index.html /usr/share/nginx/html/index.html
-EXPOSE ${APP_PORT}
+EXPOSE ${web_port}
 EOF
-else
-  cat > "$WORK_DIR/microservices/web/Dockerfile" <<EOF
-FROM nginx:alpine
-COPY index.html /usr/share/nginx/html/index.html
-EXPOSE ${APP_PORT}
-EOF
-fi
 
-# ----- README à la racine ----------------------------------------------------
-cat > "$WORK_DIR/README.md" <<EOF
+  # ----- README à la racine ----------------------------------------------------
+  cat > "$WORK_DIR/README.md" <<EOF
 # ${APP_NAME} — chaîne IA-pilotée
 
 > Application microservices déployée sur Kubernetes (k3s), pipeline CI/CD GitHub Actions, pilotée en langage naturel via 4 Skills Claude Code custom.
@@ -276,7 +265,7 @@ cat > "$WORK_DIR/README.md" <<EOF
 ## Quickstart
 
 \`\`\`bash
-git clone https://github.com/${APP_AUTHOR}/${APP_NAME}
+git clone https://github.com/${author}/${APP_NAME}
 cd ${APP_NAME}
 
 claude
@@ -287,9 +276,9 @@ claude
 
 \`\`\`
 .
-├── microservices/
-│   ├── api/         # Express.js — port ${API_PORT} — endpoints /, /health, /info
-│   └── web/         # nginx + HTML statique — port ${APP_PORT}
+├── services/
+│   ├── api/         # Express.js — port ${api_port} — endpoints /, /health, /info
+│   └── web/         # nginx (non privilégié) + HTML statique — port ${web_port}
 ├── k8s/base/        # Manifests Kubernetes (deployments + ingress)
 ├── .github/workflows/
 │   └── deploy.yml   # Pipeline CI/CD : build → push → deploy
@@ -307,9 +296,10 @@ claude
 
 ## Auteur
 
-${APP_AUTHOR}
+${author}
 EOF
 
-echo "  - microservices/api/{package.json, server.js, Dockerfile} (port ${API_PORT})"
-echo "  - microservices/web/{index.html, Dockerfile} (port ${APP_PORT})"
-echo "  - README.md"
+  ui_ok "services/api/{package.json, server.js, Dockerfile} (port ${api_port})"
+  ui_ok "services/web/{index.html, Dockerfile} (port ${web_port})"
+  ui_ok "README.md"
+}
