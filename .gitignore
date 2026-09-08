@@ -1,6 +1,10 @@
 # Workspaces (état local de chaque projet — jamais versionner)
 runs/
 
+# Cible SSH de test (engine/tools/test-target.sh) : clé privée dédiée,
+# config Lima générée, alias SSH — jamais versionner.
+.test-target/
+
 # Legacy (ancien layout ; supprimé au jalon 1, gardé pour les vieux clones)
 .bootstrap-env
 .bootstrap-state
