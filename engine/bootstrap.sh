@@ -74,8 +74,12 @@ DRY_RUN=0
 
 while (( $# > 0 )); do
   case "$1" in
-    --workspace|-w) WS_NAME="${2:-}"; shift 2 ;;
-    --step)         STEP_NAME="${2:-}"; MODE="step"; shift 2 ;;
+    --workspace|-w)
+      [[ $# -ge 2 ]] || die "--workspace requiert une valeur (nom de workspace)" 2
+      WS_NAME="$2"; shift 2 ;;
+    --step)
+      [[ $# -ge 2 ]] || die "--step requiert une valeur (nom d'étape)" 2
+      STEP_NAME="$2"; MODE="step"; shift 2 ;;
     --all)          MODE="all"; shift ;;
     --list-steps)   MODE="list"; shift ;;
     --dry-run)      DRY_RUN=1; shift ;;
