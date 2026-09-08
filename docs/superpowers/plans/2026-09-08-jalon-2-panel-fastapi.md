@@ -4773,3 +4773,587 @@ git commit -m "feat(infra): image commune panel/worker en UID 10001 avec les out
 ```
 
 ---
+
+## Task 21: `compose.yml` — la stack du panneau (rôle Infra)
+
+**Files:**
+- Create: `compose.yml`, `secrets/.gitkeep`
+- Modify: `.gitignore` (ajouter `secrets/*` sauf `.gitkeep`)
+
+**Interfaces:**
+- Consumes: l'image de la Task 20, `.env.example`, contrat **C7**.
+- Produces: quatre services (`panel`, `worker`, `postgres`, `redis`), un volume nommé `pgdata`, un montage lié `./runs`, deux secrets Docker (`panel_secret_key`, `worker_ssh_key`), et une seule publication de port : `127.0.0.1:8080 -> panel:8000`.
+
+**Les sept invariants de cette stack, chacun vérifiable :**
+1. `panel` et `worker` en `user: "10001:10001"`, `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`.
+2. **Aucun montage de `/var/run/docker.sock`, nulle part.** Grep de vérification dans les critères d'acceptation.
+3. Le port du panneau est publié sur `127.0.0.1` **uniquement** — BunkerWeb le reverse-proxifie, et personne d'autre ne l'atteint.
+4. `runs/` est un montage **partagé** entre `panel` et `worker` : le panneau y lit les logs pour le snapshot SSE, le worker y écrit `env.json` en 600. Même UID des deux côtés, sinon les 600 rendent les fichiers illisibles.
+5. La clé SSH du worker arrive par un **secret Docker** en lecture seule (`/run/secrets/worker_ssh_key`), jamais dans l'image ni dans le dépôt.
+6. Healthchecks sur les **quatre** services, `depends_on` avec `condition: service_healthy`.
+7. `postgres` et `redis` ne publient **aucun** port : ils ne sont joignables que par le réseau interne de la stack.
+
+- [ ] **Step 1: Écrire `compose.yml`**
+
+```yaml
+# Stack du panneau DeployMatic.
+# BunkerWeb n'est PAS ici : il tourne déjà sur 10.13.3.211 (DMZ) et
+# reverse-proxifie 127.0.0.1:8080. Les applications déployées ne sont pas ici
+# non plus : elles tournent sur les hôtes cibles, joints en SSH.
+
+name: deploymatic
+
+x-panel-image: &panel-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: deploymatic-panel:latest
+
+x-panel-common: &panel-common
+  restart: unless-stopped
+  user: "10001:10001"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  environment:
+    PANEL_DATABASE_URL: postgresql+psycopg://panel:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requis}@postgres:5432/panel
+    PANEL_REDIS_URL: redis://redis:6379/0
+    PANEL_RUNS_DIR: /app/runs
+    PANEL_ENGINE_PATH: /app/engine/bootstrap.sh
+    PANEL_ALLOWED_ORIGINS: ${PANEL_ALLOWED_ORIGINS:-["http://127.0.0.1:8080"]}
+    PANEL_COOKIE_SECURE: ${PANEL_COOKIE_SECURE:-true}
+    # La clé n'est PAS dans l'environnement : elle est lue depuis le secret
+    # monté, via PANEL_SECRET_KEY_FILE. Une variable d'environnement est
+    # lisible dans `docker inspect` et dans /proc/<pid>/environ.
+    PANEL_SECRET_KEY_FILE: /run/secrets/panel_secret_key
+  secrets:
+    - panel_secret_key
+  volumes:
+    # Montage PARTAGÉ : le worker écrit env.json en 600, le panel lit les logs
+    # pour le snapshot SSE. Même UID des deux côtés, sinon les 600 bloquent.
+    - ./runs:/app/runs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  panel:
+    <<: [*panel-image, *panel-common]
+    environment:
+      <<: *panel-common
+      PANEL_ADMIN_PASSWORD: ${PANEL_ADMIN_PASSWORD:?PANEL_ADMIN_PASSWORD requis au premier démarrage}
+    ports:
+      # 127.0.0.1 UNIQUEMENT. Le panneau est un exécuteur de code à distance :
+      # il n'a rien à faire sur une interface publique. BunkerWeb le
+      # reverse-proxifie, avec auth_basic et une allowlist IP EN PLUS de
+      # l'authentification applicative (cf. docs/PANEL.md).
+      - "127.0.0.1:8080:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: [*panel-image, *panel-common]
+    command: ["python", "-m", "panel.worker.main"]
+    secrets:
+      - panel_secret_key
+      - worker_ssh_key       # /run/secrets/worker_ssh_key, en lecture seule
+    healthcheck:
+      # Un worker RQ ne sert pas de HTTP : sa santé, c'est « je suis enregistré
+      # dans Redis et mon heartbeat est frais ». `rq info` le dit.
+      test: ["CMD", "sh", "-c", "rq info --url $$PANEL_REDIS_URL --only-workers | grep -q ' idle\\| busy'"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    environment:
+      POSTGRES_DB: panel
+      POSTGRES_USER: panel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requis}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Aucun port publié : joignable seulement depuis le réseau de la stack.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U panel -d panel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  pgdata:
+  redisdata:
+
+secrets:
+  panel_secret_key:
+    file: ./secrets/panel_secret_key
+  worker_ssh_key:
+    file: ./secrets/worker_ssh_key
+```
+
+- [ ] **Step 2: Ajouter la lecture de `PANEL_SECRET_KEY_FILE` à `panel/settings.py`**
+
+Un secret Docker est un **fichier**, pas une variable. Ajouter un validateur dans `Settings` (Task 1) — c'est la seule modification rétroactive de ce plan, et elle est volontairement portée par la tâche Infra puisqu'elle sert le contrat **C7** :
+
+```python
+    secret_key_file: Path | None = None
+
+    @model_validator(mode="after")
+    def _lire_les_secrets_fichiers(self) -> "Settings":
+        """Un secret Docker est un fichier monté en lecture seule. Le lire ici
+        évite de mettre la clé dans l'environnement, où `docker inspect` et
+        /proc/<pid>/environ la révéleraient."""
+        if self.secret_key_file and self.secret_key_file.exists():
+            object.__setattr__(self, "secret_key",
+                               self.secret_key_file.read_text().strip())
+        if not self.secret_key or len(self.secret_key) < 32:
+            raise ValueError(
+                "PANEL_SECRET_KEY (ou PANEL_SECRET_KEY_FILE) est requis : "
+                "Fernet.generate_key()"
+            )
+        return self
+```
+
+et le test correspondant dans `tests/test_settings.py` :
+
+```python
+def test_la_cle_peut_venir_dun_fichier_secret(tmp_path, monkeypatch):
+    fichier = tmp_path / "panel_secret_key"
+    fichier.write_text("y" * 43 + "=\n")
+    monkeypatch.delenv("PANEL_SECRET_KEY", raising=False)
+    monkeypatch.setenv("PANEL_SECRET_KEY_FILE", str(fichier))
+    from panel.settings import Settings
+    assert Settings().secret_key == "y" * 43 + "="      # le \n est retiré
+```
+
+- [ ] **Step 3: Générer les secrets locaux et démarrer**
+
+```bash
+mkdir -p secrets && chmod 700 secrets
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" \
+  > secrets/panel_secret_key
+cp .test-target/id_ed25519 secrets/worker_ssh_key    # la clé de la cible de test
+chmod 600 secrets/panel_secret_key secrets/worker_ssh_key
+
+cat > .env <<'EOF'
+POSTGRES_PASSWORD=un-mot-de-passe-postgres-local
+PANEL_ADMIN_PASSWORD=un-mot-de-passe-admin-de-12-caracteres-minimum
+PANEL_ALLOWED_ORIGINS=["http://127.0.0.1:8080"]
+EOF
+chmod 600 .env
+
+docker compose config --quiet && echo "compose valide"
+docker compose up -d
+docker compose ps        # attendu : les 4 services en (healthy)
+```
+
+- [ ] **Step 4: Vérifier les sept invariants**
+
+```bash
+echo "--- 1. UID non-root et no-new-privileges ---"
+docker compose exec panel id
+docker compose exec worker id
+docker inspect deploymatic-panel-1 deploymatic-worker-1 \
+  --format '{{.Name}} {{.HostConfig.SecurityOpt}} {{.Config.User}}'
+
+echo "--- 2. le socket Docker n'est monté nulle part ---"
+grep -rn 'docker.sock' compose.yml Dockerfile && echo "ÉCHEC" || echo "OK : aucune occurrence"
+docker inspect $(docker compose ps -q) --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}}' \
+  | grep -c docker.sock
+
+echo "--- 3. publication sur 127.0.0.1 uniquement ---"
+docker compose port panel 8000                      # attendu : 127.0.0.1:8080
+ss -ltn 2>/dev/null | grep 8080 || netstat -an | grep 8080
+
+echo "--- 4. runs/ partagé, mêmes UID ---"
+docker compose exec worker sh -c 'touch /app/runs/.probe && ls -l /app/runs/.probe'
+docker compose exec panel sh -c 'cat /app/runs/.probe && rm /app/runs/.probe && echo lisible'
+
+echo "--- 5. clé SSH par secret, en lecture seule ---"
+docker compose exec worker sh -c 'ls -l /run/secrets/worker_ssh_key; \
+  echo x > /run/secrets/worker_ssh_key 2>&1 || echo "OK : lecture seule"'
+docker compose exec panel sh -c 'ls /run/secrets/' # panel n'a PAS la clé SSH
+
+echo "--- 6. les quatre healthchecks ---"
+docker compose ps --format '{{.Service}} {{.Status}}'
+
+echo "--- 7. postgres et redis ne publient rien ---"
+docker compose port postgres 5432 2>&1 || echo "OK : aucun port publié"
+docker compose port redis 6379 2>&1 || echo "OK : aucun port publié"
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add compose.yml .gitignore panel/settings.py tests/test_settings.py
+git commit -m "feat(infra): stack compose durcie — 4 services, secrets Docker, port sur 127.0.0.1"
+```
+
+---
+
+## Task 22: Test d'intégration de bout en bout contre la cible SSH réelle
+
+**Files:**
+- Create: `tests/integration/test_deploiement_reel.py`, `tests/integration/conftest.py`
+- Modify: `pyproject.toml` (marqueur `integration`)
+
+**Interfaces:**
+- Consumes: `engine/tools/test-target.sh` (`up`, `status`, `env`, `down`), la stack de la Task 21, l'API de la Task 11.
+- Produces: un test marqué `@pytest.mark.integration`, **exclu par défaut** de `pytest`, qui déploie réellement l'application de démo sur la VM Lima et vérifie que la stack applicative tourne.
+
+**Pourquoi cette tâche existe.** Le jalon 1 a dû déclarer son critère n°6 non vérifié faute de cible. Ce n'est plus le cas : `engine/tools/test-target.sh up` fournit une VM Ubuntu 24.04 avec systemd en 11 secondes, sans Docker préinstallé (volontairement — sinon `prepare_server` n'aurait rien à faire), et `bash engine/bootstrap.sh --workspace testvm --step validate_ssh` y répond déjà `{"ok":true,"data":{"banner":"lima-deploymatic-test-target — Ubuntu 24.04.4 LTS"}}`. Le critère d'acceptation n°5 du jalon 2 (« un déploiement complet de l'app de démo passe ») est donc **réellement** atteignable, et il doit l'être par une commande, pas par une séance de clics.
+
+**Le point que ce test valide et qu'aucun test unitaire ne peut valider** : la VM écoute sur `127.0.0.1:60122`, pas sur 22. C'est exactement ce que `Target.port` et `env.json .target.port` existent pour porter — de bout en bout, du formulaire jusqu'à `ssh -p` dans `engine/lib/ssh_remote.sh`. Si le champ était perdu quelque part dans la chaîne, ce test est le seul à le voir.
+
+- [ ] **Step 1: Déclarer le marqueur dans `pyproject.toml`**
+
+```toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-m 'not integration'"          # la suite par défaut reste hermétique
+markers = ["integration: exige la VM Lima et la stack Docker debout"]
+```
+
+- [ ] **Step 2: Écrire `tests/integration/conftest.py`**
+
+```python
+"""Fixtures d'intégration : la VM Lima et la stack Docker doivent être debout.
+
+Ces tests ne montent RIEN tout seuls. Démarrer une VM et une stack depuis une
+fixture rend les échecs illisibles (« est-ce le test ou l'environnement ? ») et
+les temps d'exécution imprévisibles. On exige l'environnement, on le vérifie,
+et on saute proprement s'il manque.
+"""
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BASE_URL = "http://127.0.0.1:8080"
+
+
+def _cible_disponible() -> bool:
+    r = subprocess.run(["bash", str(REPO_ROOT / "engine" / "tools" / "test-target.sh"),
+                        "status"], capture_output=True, text=True)
+    return "Running" in r.stdout
+
+
+@pytest.fixture(scope="session")
+def cible() -> dict:
+    if not _cible_disponible():
+        pytest.skip("VM absente : lancer `engine/tools/test-target.sh up`")
+    env = subprocess.run(
+        ["bash", str(REPO_ROOT / "engine" / "tools" / "test-target.sh"), "env"],
+        capture_output=True, text=True, check=True)
+    return json.loads(env.stdout)["target"]
+
+
+@pytest.fixture(scope="session")
+def api():
+    import httpx
+
+    client = httpx.Client(base_url=BASE_URL, timeout=30)
+    try:
+        client.get("/healthz").raise_for_status()
+    except Exception:
+        pytest.skip("stack absente : lancer `docker compose up -d`")
+    csrf = client.get("/api/csrf").json()["csrf"]
+    import os
+    client.post("/api/login",
+                json={"username": "admin", "password": os.environ["PANEL_ADMIN_PASSWORD"]},
+                headers={"Origin": BASE_URL, "X-CSRF-Token": csrf}).raise_for_status()
+    client.headers.update({"Origin": BASE_URL,
+                           "X-CSRF-Token": client.get("/api/csrf").json()["csrf"]})
+    yield client
+    client.close()
+```
+
+- [ ] **Step 3: Écrire `tests/integration/test_deploiement_reel.py`**
+
+```python
+"""Déploiement complet de l'app de démo sur la VM Lima — critère n°5."""
+import json
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.integration
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SPEC = json.loads((REPO_ROOT / "engine" / "templates" / "spec.demo.json").read_text())
+
+
+def _attendre_run(api, run_id: int, delai: int = 1500) -> dict:
+    fin = time.monotonic() + delai
+    while time.monotonic() < fin:
+        run = api.get(f"/api/runs/{run_id}").json()
+        if run["status"] in ("ok", "failed"):
+            return run
+        time.sleep(5)
+    pytest.fail(f"run {run_id} toujours en cours après {delai}s")
+
+
+def test_deploiement_complet_de_lapp_de_demo(api, cible):
+    # 1. La cible, avec son port NON standard : c'est tout l'intérêt du champ.
+    r = api.post("/api/targets", json={
+        "name": "lima-test", "host": cible["host"], "port": cible.get("port", 22),
+        "ssh_user": cible["user"], "auth_method": "key",
+        "ssh_key_path": "/run/secrets/worker_ssh_key",
+        "bind_addr": cible["bind_addr"]})
+    assert r.status_code == 201, r.text
+    target_id = r.json()["id"]
+
+    # 2. L'application, depuis le spec de démo tel quel.
+    spec = {**SPEC, "name": "demo-integration"}
+    r = api.post("/api/apps", json={"target_id": target_id, "spec": spec,
+                                    "ports": {"api": 10001, "web": 10002}})
+    assert r.status_code == 201, r.text
+    app_id = r.json()["id"]
+
+    # 3. Le déploiement.
+    run_id = api.post(f"/api/apps/{app_id}/deploy").json()["run_id"]
+    run = _attendre_run(api, run_id)
+
+    echecs = [s for s in run["steps"] if s["status"] == "failed"]
+    assert run["status"] == "ok", f"run échoué : {run['error']} / {echecs}"
+
+    # 4. Ce qui doit avoir été exécuté, et ce qui doit avoir été sauté.
+    par_nom = {s["name"]: s for s in run["steps"]}
+    assert par_nom["prepare_workspace"]["status"] == "ok"
+    assert par_nom["prepare_server"]["status"] == "ok"
+    assert par_nom["deploy_stack"]["status"] == "ok"
+    assert par_nom["validate_deployment"]["status"] == "ok"
+    assert all(par_nom[n]["status"] == "skipped"
+               for n in ("github_create_repo", "git_push"))
+
+
+def test_la_stack_applicative_tourne_vraiment_sur_la_cible(cible):
+    """Vu depuis la cible, pas depuis le panneau : `docker compose ps` et un
+    curl sur 127.0.0.1:<port hôte>. Aucun curl sur une IP publique — c'est la
+    règle du jalon 1 et elle ne change pas."""
+    ssh = ["ssh", "-i", str(REPO_ROOT / ".test-target" / "id_ed25519"),
+           "-p", str(cible.get("port", 22)), "-o", "BatchMode=yes",
+           "-o", "StrictHostKeyChecking=accept-new",
+           f"{cible['user']}@{cible['host']}"]
+    ps = subprocess.run([*ssh, "docker ps --format '{{.Names}} {{.Status}}'"],
+                        capture_output=True, text=True, check=True)
+    assert "demo-integration" in ps.stdout, ps.stdout
+
+    sante = subprocess.run([*ssh, "curl -fsS -o /dev/null -w '%{http_code}' "
+                                  "http://127.0.0.1:10001/health"],
+                           capture_output=True, text=True)
+    assert sante.stdout.strip() == "200", sante.stdout + sante.stderr
+
+
+def test_le_second_deploiement_saute_les_etapes_deja_ok(api):
+    """D2, en conditions réelles : prepare_server ne se rejoue pas, les
+    générateurs si. C'est aussi ce qui rend un redéploiement rapide."""
+    app_id = next(a["id"] for a in api.get("/api/apps").json()
+                  if a["name"] == "demo-integration")
+    run_id = api.post(f"/api/apps/{app_id}/deploy").json()["run_id"]
+    run = _attendre_run(api, run_id)
+    assert run["status"] == "ok"
+    par_nom = {s["name"]: s for s in run["steps"]}
+    assert par_nom["prepare_server"]["status"] == "skipped"
+    assert par_nom["create_project_dir"]["status"] == "skipped"
+    assert par_nom["generate_compose"]["status"] == "ok"
+    assert par_nom["deploy_stack"]["status"] == "ok"
+
+
+def test_aucun_secret_dans_le_journal_du_run(api):
+    """Les logs sont affichés dans l'UI et conservés sur disque : un token qui
+    y atterrirait serait lisible par tout ce qui accède au volume runs/."""
+    app_id = next(a["id"] for a in api.get("/api/apps").json()
+                  if a["name"] == "demo-integration")
+    runs = [r for r in api.get("/api/apps").json() if r["id"] == app_id]
+    journal = (REPO_ROOT / "runs" / "demo-integration" / "logs")
+    contenu = "\n".join(f.read_text(errors="replace") for f in journal.glob("*.log"))
+    for motif in ("dckr_pat_", "BEGIN OPENSSH PRIVATE KEY", "PANEL_SECRET_KEY"):
+        assert motif not in contenu, f"secret dans le journal : {motif}"
+```
+
+- [ ] **Step 4: Lancer, de bout en bout**
+
+```bash
+engine/tools/test-target.sh up          # ~11 s si l'image est en cache
+engine/tools/test-target.sh status      # attendu : Running, 127.0.0.1:60122
+docker compose up -d
+
+.venv/bin/python -m pytest tests/integration -m integration -q -s
+```
+
+Attendu : 4 tests verts. Le premier prend plusieurs minutes (`prepare_server` installe réellement Docker sur une Ubuntu vierge, `build_images` transfère le contexte de build par SSH). **Le point le plus incertain reste `build_images` via `DOCKER_HOST=ssh://`** : `docs/CURRENT-STATE.md` le signale comme jamais exercé. Si c'est là que ça casse, ce n'est pas le panneau qui est en cause — remonter le diagnostic au rôle Engine avec la sortie stderr complète du run, que le journal contient déjà.
+
+- [ ] **Step 5: Nettoyer et commiter**
+
+```bash
+engine/tools/test-target.sh down        # optionnel : la VM se recrée en 11 s
+git add tests/integration pyproject.toml
+git commit -m "test(panel): déploiement de bout en bout de l'app de démo sur la cible Lima"
+```
+
+---
+
+## Task 23: Documentation d'exploitation et CI (rôle Infra)
+
+**Files:**
+- Create: `docs/PANEL.md`
+- Modify: `README.md`, `docs/CURRENT-STATE.md`, `.github/workflows/ci.yml` (ou création si absent)
+
+**Interfaces:**
+- Consumes: tout ce qui précède.
+- Produces: le mode d'emploi d'exploitation, et une CI qui fait tourner `pytest` en plus des vérifications bash existantes.
+
+- [ ] **Step 1: Écrire `docs/PANEL.md`**
+
+Plan du document, à remplir avec les valeurs réelles de la stack :
+
+```markdown
+# Le panneau — exploitation
+
+## Démarrer
+
+Prérequis, génération des secrets, `docker compose up -d`, première connexion.
+
+## Variables et secrets
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `PANEL_SECRET_KEY` / `PANEL_SECRET_KEY_FILE` | — | clé Fernet ET clé de dérivation des signatures de session. **La changer invalide tous les secrets déjà chiffrés en base et toutes les sessions.** |
+| `PANEL_ADMIN_PASSWORD` | — | mot de passe du compte unique, au PREMIER démarrage seulement |
+| `POSTGRES_PASSWORD` | — | mot de passe de la base |
+| `PANEL_ALLOWED_ORIGINS` | `["http://127.0.0.1:8080"]` | origines acceptées sur les mutations |
+| `PANEL_COOKIE_SECURE` | `true` | cf. ci-dessous |
+| `PANEL_STEP_TIMEOUT_SECONDS` | `600` | délai par étape |
+| `PANEL_RUN_TIMEOUT_SECONDS` | `1800` | délai par run |
+
+### Le cas `PANEL_COOKIE_SECURE`
+
+Le cookie de session est posé en `Secure`. Les navigateurs traitent
+`http://127.0.0.1` et `http://localhost` comme des contextes sûrs et acceptent
+un cookie `Secure` malgré l'absence de TLS : l'accès local direct fonctionne
+donc sans rien changer. En revanche, un accès par une **IP de LAN en clair**
+(`http://192.168.x.x:8080`) ne recevra jamais le cookie et la connexion
+échouera en silence. Deux réponses, dans cet ordre de préférence : mettre le
+panneau derrière BunkerWeb en HTTPS, ou — pour un poste de développement
+isolé — `PANEL_COOKIE_SECURE=false`, en sachant que la session circule alors en
+clair.
+
+## Mettre le panneau derrière BunkerWeb
+
+`auth_basic` + allowlist IP, **en plus** de l'authentification applicative,
+jamais à la place. Deux raisons : une authentification d'edge ne protège pas du
+CSRF (le navigateur de la victime envoie ses identifiants avec la requête
+forgée), et une allowlist ne dit rien de qui est derrière l'IP.
+
+Réglages BunkerWeb nécessaires au SSE : ne pas tamponner la réponse
+(`X-Accel-Buffering: no` est déjà envoyé par le panneau), et un timeout de
+lecture supérieur à la durée d'un run.
+
+## La clé SSH du worker
+
+Secret Docker `worker_ssh_key`, monté en lecture seule sur
+`/run/secrets/worker_ssh_key`. C'est le chemin à saisir dans le champ
+« chemin de clé SSH » d'une cible. Le panneau, lui, n'a PAS ce secret : il ne
+se connecte à rien.
+
+## Sauvegarder
+
+`pgdata` (base) et `runs/` (specs et journaux). Les secrets applicatifs sont
+chiffrés dans la base : une sauvegarde de `pgdata` SANS `PANEL_SECRET_KEY` est
+inexploitable — sauvegarder la clé séparément, et pas au même endroit.
+
+## Diagnostic
+
+| Symptôme | Piste |
+|---|---|
+| Un run reste en `queued` | le worker est-il `healthy` ? `docker compose logs worker` |
+| Un run est passé en `failed` avec « le job RQ n'existe plus » | le worker a redémarré pendant le run — c'est la réconciliation qui a fait son travail, relancer le déploiement |
+| `403 origin refusé` | `PANEL_ALLOWED_ORIGINS` ne contient pas l'URL réellement utilisée |
+| Connexion impossible sans message | cookie `Secure` non accepté, cf. `PANEL_COOKIE_SECURE` |
+| Les logs n'arrivent pas en direct | tamponnage du proxy ; vérifier que le SSE passe en direct avec `curl -N` |
+```
+
+- [ ] **Step 2: Mettre à jour `README.md`**
+
+- Retirer l'encadré « interface web hors service » du jalon 1 : elle existe de nouveau.
+- Section « Démarrage rapide » : `docker compose up -d` et `http://127.0.0.1:8080`.
+- Ajouter une section « Architecture » en trois lignes : le panneau orchestre, le worker exécute l'engine, l'engine agit sur la cible en SSH.
+- Renvoyer vers `docs/PANEL.md` pour l'exploitation et `docs/ENGINE.md` pour le contrat.
+
+- [ ] **Step 3: Ajouter `pytest` à la CI**
+
+```yaml
+  tests-panel:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8-alpine
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -e '.[dev]'
+      - name: pytest
+        env:
+          PANEL_SECRET_KEY: ${{ secrets.CI_PANEL_SECRET_KEY }}
+          PANEL_ADMIN_PASSWORD: mot-de-passe-de-ci-1234
+        # -m 'not integration' est déjà dans addopts : la CI hébergée n'a ni
+        # VM Lima ni cible SSH, et un runner GitHub ne peut pas joindre une
+        # adresse RFC1918. Le test de bout en bout reste une commande locale.
+        run: python -m pytest -q
+      - name: la suite bash de l'engine ne doit pas régresser
+        run: bash engine/tests/run.sh
+```
+
+- [ ] **Step 4: Mettre à jour `docs/CURRENT-STATE.md`**
+
+Le document est daté et se périme vite : mettre à jour le tableau « Ce qui marche aujourd'hui » (l'interface web existe de nouveau, en FastAPI), retirer `web/` de « ce qui est cassé volontairement » puisqu'il n'existe plus, et remplacer la ligne « Interface web — bloqué par jalon 2 ».
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add docs/PANEL.md README.md docs/CURRENT-STATE.md .github/workflows/ci.yml
+git commit -m "docs(panel): exploitation, mise derrière BunkerWeb, pytest dans la CI"
+```
+
+---
