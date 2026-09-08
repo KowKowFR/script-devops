@@ -76,7 +76,7 @@ assert_eq "api web" \
   "les chemins exposés sont triés du plus spécifique au plus général"
 
 # spec_get doit distinguer un champ absent d'un champ présent mais vide/false
-assert_eq "" "$(run_spec 'spec_get testcase empty_string')" \
+assert_eq "" "$(run_spec 'spec_get testcase empty_string defaut_vide')" \
   "spec_get retourne chaîne vide explicite (pas le défaut)"
 assert_eq "false" "$(run_spec 'spec_get testcase false_bool')" \
   "spec_get retourne false comme 'false' (pas le défaut)"
@@ -84,5 +84,13 @@ assert_eq "defaut" "$(run_spec 'spec_get testcase null_val defaut')" \
   "spec_get applique le défaut pour null"
 assert_eq "0" "$(run_spec 'spec_get testcase zero_num')" \
   "spec_get retourne 0 comme '0' (pas le défaut)"
+
+# spec_get doit appliquer le défaut quand le service n'existe pas (finding A)
+assert_eq "mondefaut" "$(run_spec 'spec_get service_inexistant champ mondefaut')" \
+  "spec_get applique le défaut quand le service n'existe pas"
+assert_eq "" "$(run_spec 'spec_get service_inexistant champ')" \
+  "spec_get retourne vide (défaut vide) quand service inexistant sans défaut"
+assert_eq "" "$(run_spec 'spec_get testcase empty_string mondefaut')" \
+  "non-régression : champ '' avec défaut non-vide retourne '' (pas le défaut)"
 
 finish

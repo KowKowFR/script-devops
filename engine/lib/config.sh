@@ -96,14 +96,14 @@ spec_get() {
   # - champ = false → retour "false" (valeur explicite)
   # - champ = "" → retour "" (chaîne vide explicite, pas le défaut)
   value=$(jq -r --arg s "$sid" --arg f "$field" '
-    .services[] | select(.id == $s) |
+    (.services[] | select(.id == $s) |
     if has($f) then
       .[$f] | if . == null then "<<NULL>>"
               elif type == "boolean" or type == "number" then tostring
               else . end
     else
       "<<ABSENT>>"
-    end
+    end) // "<<ABSENT>>"
   ' "$SPEC_JSON" 2>/dev/null || printf '<<ABSENT>>')
   if [[ "$value" == "<<ABSENT>>" ]] || [[ "$value" == "<<NULL>>" ]]; then
     printf '%s' "$default"
