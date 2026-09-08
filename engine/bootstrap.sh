@@ -39,6 +39,8 @@ set -euo pipefail
 # ----- Chargement des modules -----------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+readonly REPO_ROOT
 
 # shellcheck source=lib/ui.sh
 source "$SCRIPT_DIR/lib/ui.sh"
@@ -62,7 +64,7 @@ source "$SCRIPT_DIR/lib/steps.sh"
 source "$SCRIPT_DIR/lib/diag.sh"
 
 # ----- Constantes -----------------------------------------------------------
-readonly RUNS_DIR="${SCRIPT_DIR}/runs"
+readonly RUNS_DIR="${REPO_ROOT}/runs"
 readonly PROJECT_NAME="tp-devops-agent-ia"
 
 # Workspace courant (peut être surchargé par --workspace ou $WORKSPACE).

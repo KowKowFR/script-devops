@@ -1,23 +1,19 @@
 # Workspaces (état local de chaque projet — jamais versionner)
 runs/
 
-# Legacy (ancien layout, gardés au cas où un user revient en arrière)
+# Legacy (ancien layout ; supprimé au jalon 1, gardé pour les vieux clones)
 .bootstrap-env
-.bootstrap-env.bak
 .bootstrap-state
-.bootstrap-state.tmp
 .bootstrap.log
 .bootstrap.lock
 .bootstrap.web.pid
+tp-devops-agent-ia/
 
 # Web UI : venv + caches Python
 web/venv/
 web/__pycache__/
 web/**/__pycache__/
 *.pyc
-
-# Projet généré legacy (a son propre repo)
-tp-devops-agent-ia/
 
 # OS
 .DS_Store
