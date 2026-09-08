@@ -2027,6 +2027,11 @@ L'original a **deux sections numérotées « 9 »** (fail2ban et MOTD). Renumér
 
 - [ ] **Step 6: Authentifier Docker Hub sans exposer le token**
 
+Le couple utilisateur/token arrive sur **stdin**, en deux premières lignes avant
+le corps du script (cf. `step_prepare_server`, Task 11) : `step_prepare_server`
+les lit avec `read` et les exporte avant de lancer ce script. Ils ne figurent
+donc ni dans la ligne de commande SSH, ni dans `ps` côté cible.
+
 Ajouter une section, avant le récapitulatif :
 
 ```bash
@@ -2254,11 +2259,18 @@ step_prepare_server() {
   fi
 
   ui_info "Provisioning de ${host} (docker, ufw, fail2ban)…"
-  # Le token part par l'environnement de la session SSH, pas en argument.
-  REGISTRY_TOKEN="$(cfg registry.token)" \
-  ssh_remote "${user}@${host}" \
-    "REGISTRY_USER='$(cfg registry.user)' REGISTRY_TOKEN='$(cfg registry.token)' bash -s" \
-    < "$(dirname "${BASH_SOURCE[0]}")/prepare_server.sh" >&2 \
+
+  # Le token NE DOIT PAS transiter par la ligne de commande distante : elle est
+  # visible dans `ps` sur la cible pendant toute la durée du provisioning, et
+  # une apostrophe dans le token casserait le quoting. On le passe sur stdin,
+  # en tête du script, et prepare_server.sh le lit avec `read`.
+  {
+    printf '%s\n' "$(cfg registry.user)"
+    printf '%s\n' "$(cfg registry.token)"
+    cat "$(dirname "${BASH_SOURCE[0]}")/prepare_server.sh"
+  } | ssh_remote "${user}@${host}" \
+        'IFS= read -r REGISTRY_USER; IFS= read -r REGISTRY_TOKEN; \
+         export REGISTRY_USER REGISTRY_TOKEN; bash -s' >&2 \
     || retryable "le provisioning du serveur a échoué"
 
   ui_ok "Serveur prêt"
