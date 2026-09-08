@@ -1,72 +1,58 @@
 #!/usr/bin/env bash
-# lib/runtime.sh — Logging, lock file, trap d'erreur, dry-run.
+# engine/lib/runtime.sh — contrat de sortie de l'engine et trap d'erreur.
 #
-# Dépend de : LOG_FILE, LOCK_FILE, ui_*, _CURRENT_STEP (mis à jour par bootstrap.sh).
-
-# ----- Logging --------------------------------------------------------------
-# Tee tout stdout/stderr vers LOG_FILE en préfixant d'un timestamp.
-# Les codes ANSI sont préservés (ouvre le log avec `less -R` ou `cat`).
+# CONTRAT (invariant du projet, cf. docs) :
+#   - Les logs partent sur stderr, en clair, ligne par ligne.
+#   - stdout ne reçoit QUE la ligne de résultat finale, en JSON.
+#   - Codes de sortie : 0 succès, 1 échec réessayable, 2 échec fatal.
 #
-# Notes d'implémentation :
-# - On évite `awk strftime` (BSD awk de macOS ne le supporte pas).
-# - Le wrapper Bash + `date` est plus lent mais portable Linux/macOS.
-# - La process substitution `>(...)` est cachée dans un `eval` : ainsi le
-#   fichier se parse correctement même en POSIX sh (qui ne connaît pas `>(...)`)
-#   et on peut tester sa dispo à l'exécution avant de l'activer.
-log_init() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  echo "=== bootstrap.sh started at $(date '+%Y-%m-%d %H:%M:%S') ===" > "$LOG_FILE"
+# L'engine n'écrit aucun fichier de log : c'est l'appelant (worker du panel,
+# ou le shell interactif) qui capture stderr. Le stdout doit rester pur JSON.
 
-  # Détecte si la process substitution fonctionne dans ce shell.
-  if ! eval 'exec 7> >(cat >/dev/null) && exec 7>&-' 2>/dev/null; then
-    echo "[warn] Process substitution indisponible (shell POSIX ?) — .bootstrap.log désactivé" >&2
-    return 0
+_CURRENT_STEP=""
+
+# emit_ok [JSON_OBJET] — imprime le résultat de succès sur stdout.
+# N'appelle pas exit : c'est l'étape qui décide de sa sortie.
+emit_ok() {
+  local data="${1:-null}"
+  if ! printf '%s' "$data" | jq -e . >/dev/null 2>&1; then
+    data="null"
   fi
-
-  eval '
-    exec  > >(while IFS= read -r line; do printf "[%s] %s\n"      "$(date +%H:%M:%S)" "$line"; done | tee -a "$LOG_FILE")
-    exec 2> >(while IFS= read -r line; do printf "[%s][err] %s\n" "$(date +%H:%M:%S)" "$line"; done | tee -a "$LOG_FILE" >&2)
-  '
+  jq -cn --argjson data "$data" '{ok: true, data: $data}'
 }
 
-# ----- Lock file (anti-concurrence) -----------------------------------------
-acquire_lock() {
-  if [[ -f "$LOCK_FILE" ]]; then
-    local pid
-    pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      ui_err "Une autre instance de bootstrap.sh tourne (PID $pid)"
-      ui_info "Si c'est faux : rm ${LOCK_FILE}"
-      exit 1
-    fi
-    # Stale lock : on récupère
-    rm -f "$LOCK_FILE"
-  fi
-  echo $$ > "$LOCK_FILE"
-  trap 'release_lock' EXIT
+# emit_fail MESSAGE — imprime le résultat d'échec sur stdout.
+emit_fail() {
+  jq -cn --arg error "${1:-erreur inconnue}" '{ok: false, error: $error}'
 }
 
-release_lock() {
-  rm -f "$LOCK_FILE"
+# die MESSAGE [CODE] — échec fatal (défaut : 2, non réessayable).
+die() {
+  emit_fail "${1:-erreur fatale}"
+  exit "${2:-2}"
+}
+
+# retryable MESSAGE — échec réessayable (code 1).
+retryable() {
+  emit_fail "${1:-erreur temporaire}"
+  exit 1
 }
 
 # ----- Trap d'erreur global -------------------------------------------------
-# _CURRENT_STEP est tenu à jour par run_pipeline pour contextualiser l'erreur.
-_CURRENT_STEP=""
-
+# Toute commande qui échoue sous `set -e` passe ici : on transforme la panne en
+# résultat JSON pour que l'appelant n'ait jamais à parser du texte libre.
 error_handler() {
   local exit_code=$?
   local line="$1"
   local cmd="$2"
-  ui_err "Échec à l'étape '${_CURRENT_STEP:-<orchestration>}' (ligne $line, exit=$exit_code)"
-  ui_info "Commande : ${cmd}"
-  ui_info "Log complet : ${LOG_FILE}"
-  ui_info "Reprendre depuis l'état courant : ./bootstrap.sh"
-  exit "$exit_code"
+  ui_err "Échec dans '${_CURRENT_STEP:-<engine>}' (ligne ${line}, exit=${exit_code})"
+  ui_err "Commande : ${cmd}"
+  emit_fail "étape '${_CURRENT_STEP:-inconnue}' : ${cmd} (ligne ${line}, exit ${exit_code})"
+  exit 1
 }
 
 install_error_trap() {
-  # `set -E` propage ERR aux fonctions/subshells. Doit être appelé après `set -e`.
+  # `set -E` propage ERR aux fonctions et sous-shells. À appeler après `set -e`.
   set -E
   trap 'error_handler "$LINENO" "$BASH_COMMAND"' ERR
 }
