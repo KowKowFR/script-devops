@@ -82,20 +82,49 @@ spec_init() {
   # "$sid"`). Le placer ici, dans spec_init, protège TOUS les consommateurs de
   # spec.json — pas seulement gen_compose — dès aujourd'hui et pour les
   # consommateurs futurs (jalon 5 : spec.json généré par un LLM).
-  local bad_ids
-  bad_ids=$(jq -r '
+  #
+  # Piège corrigé (revue round 2) : la présence d'ids invalides NE DOIT PAS se
+  # décider sur le résultat d'un `join(", ")` — un id vide, unique invalide
+  # trouvé, joint en chaîne VIDE, indistinguable de "aucun id invalide" pour
+  # un `[[ -z "$bad_ids" ]]`. Le nombre d'éléments (`length`) est la seule
+  # information fiable ; la chaîne jointe ne sert plus qu'au message.
+  local bad_result bad_count bad_ids
+  bad_result=$(jq -c '
     [ .services[].id
       | (if type == "string" then . else tojson end) as $s
       | select(($s | test("^[A-Za-z0-9_-]+$")) | not)
-      | $s
-    ] | join(", ")
+      | (if $s == "" then "<vide>" else $s end)
+    ] as $bad
+    | {count: ($bad | length), joined: ($bad | join(", "))}
   ' "$SPEC_JSON" 2>/dev/null)
-  [[ -z "$bad_ids" ]] \
-    || die "id(s) de service invalide(s) dans spec.json (lettres, chiffres, '_' et '-' uniquement) : ${bad_ids}" 2
+  bad_count=$(printf '%s' "$bad_result" | jq -r '.count // 0' 2>/dev/null)
+  bad_ids=$(printf '%s' "$bad_result" | jq -r '.joined // ""' 2>/dev/null)
+  [[ "${bad_count:-0}" -gt 0 ]] \
+    && die "id(s) de service invalide(s) dans spec.json (lettres, chiffres, '_' et '-' uniquement) : ${bad_ids}" 2
 
-  local dupes
-  dupes=$(jq -r '[.services[].id] | group_by(.) | map(select(length > 1) | .[0]) | join(",")' "$SPEC_JSON")
-  [[ -z "$dupes" ]] || die "ids de service dupliqués dans spec.json : ${dupes}" 2
+  # Même raisonnement pour les doublons : un id dupliqué qui vaut la chaîne
+  # vide se joint aussi en chaîne vide dès qu'il n'y en a qu'UN à rapporter
+  # (le représentant de chaque groupe de doublons). Avec deux ids vides le
+  # groupe entier est ["", ""] mais on ne rapporte QUE le premier représentant
+  # de chaque groupe en doublon — donc UN SEUL élément vide dans le résultat,
+  # qui se joint bien en chaîne vide et masquait le défaut identique.
+  local dupes_result dupes_count dupes
+  dupes_result=$(jq -c '
+    [.services[].id] | group_by(.) | map(select(length > 1) | .[0])
+    | map(if . == "" then "<vide>" else . end) as $dupes
+    | {count: ($dupes | length), joined: ($dupes | join(", "))}
+  ' "$SPEC_JSON")
+  dupes_count=$(printf '%s' "$dupes_result" | jq -r '.count // 0' 2>/dev/null)
+  dupes=$(printf '%s' "$dupes_result" | jq -r '.joined // ""' 2>/dev/null)
+  [[ "${dupes_count:-0}" -gt 0 ]] \
+    && die "ids de service dupliqués dans spec.json : ${dupes}" 2
+
+  # `return 0` explicite : sans lui, la valeur de retour IMPLICITE de la
+  # fonction est celle de la DERNIÈRE commande exécutée — ici un `[[ ... -gt
+  # 0 ]]` qui vaut justement FAUX (statut 1) sur le chemin de succès. Piège
+  # vérifié empiriquement (bash -x) en écrivant ce correctif : sans ce
+  # `return 0`, spec_init sortait en 1 alors que la validation avait réussi.
+  return 0
 }
 
 spec_service_ids() {

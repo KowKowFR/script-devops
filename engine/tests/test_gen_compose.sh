@@ -336,4 +336,103 @@ _poc5_case "espace"      "svc bad"
 _poc5_case "substitution" 'svc$(id)'
 _poc5_case "slash"       "svc/evil"
 
+# ==========================================================================
+# Revue round 2, finding A — id vide : aucun service ne peut disparaître
+# en silence. spec_init doit mourir (déjà couvert dans test_config.sh) ; ici
+# on vérifie le comportement de bout en bout via gen_compose : pas de succès
+# partiel, le service valide voisin d'un id vide n'est PAS silencieusement
+# généré.
+# ==========================================================================
+POC6_WORK="$WORK/poc6"; mkdir -p "$POC6_WORK"
+POC6_ENV="$WORK/poc6.env.json"
+POC6_SPEC="$WORK/poc6.spec.json"
+cat > "$POC6_ENV" <<'EOF'
+{ "registry": { "user": "reguser" } }
+EOF
+cat > "$POC6_SPEC" <<'EOF'
+{"name":"poc","services":[{"id":"","image":"alpine"},{"id":"good","image":"alpine"}]}
+EOF
+rc6=$(_run_gen_compose "$POC6_WORK" "$POC6_ENV" "$POC6_SPEC" "poc6")
+assert_eq "2" "$rc6" "id vide + id valide : gen_compose échoue en code 2 (pas de succès partiel)"
+assert_eq "0" "$([[ -f "$POC6_WORK/deploy/compose.yml" ]] && echo 1 || echo 0)" \
+  "id vide + id valide : le service valide n'est PAS silencieusement généré (aucun compose.yml)"
+
+# ==========================================================================
+# Revue round 2, finding B — les `mv -f` finaux doivent être vérifiés.
+# ==========================================================================
+# _run_gen_compose_broken_mv WORKDIR ENV_JSON SPEC_JSON APP_NAME SUFFIXE [STDOUT_FILE]
+# — comme _run_gen_compose, mais shadow la commande `mv` : tout appel dont un
+# des arguments se TERMINE exactement par SUFFIXE échoue (simule un
+# renommage impossible, ex. permission refusée). Correspondance sur le
+# SUFFIXE exact d'un argument (pas une sous-chaîne de "$*") pour ne pas
+# confondre "/.env" et "/.env.example", qui partagent un préfixe.
+_run_gen_compose_broken_mv() {
+  local w="$1" ej="$2" sj="$3" app="$4" suffix="$5" outfile="${6:-/dev/null}"
+  bash -c "
+    source '$ENGINE_DIR/lib/ui.sh'
+    source '$ENGINE_DIR/lib/runtime.sh'
+    source '$ENGINE_DIR/lib/units.sh'
+    source '$ENGINE_DIR/lib/config.sh'
+    ENV_JSON='$ej'; SPEC_JSON='$sj'
+    WORK_DIR='$w'; APP_NAME='$app'
+    source '$ENGINE_DIR/lib/gen_compose.sh'
+    mv() {
+      local __a
+      for __a in \"\$@\"; do
+        case \"\$__a\" in
+          *'$suffix') return 1 ;;
+        esac
+      done
+      command mv \"\$@\"
+    }
+    gen_compose
+  " >"$outfile" 2>/dev/null
+  printf '%s' "$?"
+}
+
+# --- Preuve 4 : renommage de compose.yml impossible ------------------------
+POC7_WORK="$WORK/poc7"; mkdir -p "$POC7_WORK/deploy"
+printf 'ANCIEN CONTENU COMPOSE\n' > "$POC7_WORK/deploy/compose.yml"
+POC7_OUT="$WORK/poc7.stdout"
+rc7=$(_run_gen_compose_broken_mv "$POC7_WORK" "$ENV_FIX" "$SPEC_FIX" "poc7" "/compose.yml" "$POC7_OUT")
+assert_eq "2" "$rc7" "renommage compose.yml impossible : code de sortie 2"
+assert_eq "ANCIEN CONTENU COMPOSE" "$(cat "$POC7_WORK/deploy/compose.yml")" \
+  "renommage compose.yml impossible : l'ancien fichier reste en place (pas de faux succès)"
+poc7_stdout=$(cat "$POC7_OUT")
+assert_contains "$poc7_stdout" '"ok":false' \
+  "renommage compose.yml impossible : le JSON annonce l'échec (aucun faux ui_ok)"
+assert_contains "$poc7_stdout" "échec du renommage atomique" \
+  "renommage compose.yml impossible : message clair"
+leftover7=$(find "$POC7_WORK/deploy" -name '.compose.yml.*' 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "0" "$leftover7" "renommage compose.yml impossible : le fichier temporaire est nettoyé"
+
+# --- Preuve 5 : renommage de .env impossible après un compose.yml réussi ---
+# (état mixte : le message doit dire explicitement ce qui a été écrit et ce
+# qui ne l'a pas été, plutôt que de laisser l'appelant deviner)
+POC8_WORK="$WORK/poc8"; mkdir -p "$POC8_WORK/deploy"
+printf 'ANCIEN .env\n' > "$POC8_WORK/deploy/.env"
+POC8_OUT="$WORK/poc8.stdout"
+rc8=$(_run_gen_compose_broken_mv "$POC8_WORK" "$ENV_FIX" "$SPEC_FIX" "poc8" "/.env" "$POC8_OUT")
+assert_eq "2" "$rc8" "renommage .env impossible (après compose.yml réussi) : code de sortie 2"
+assert_eq "1" "$([[ -f "$POC8_WORK/deploy/compose.yml" ]] && echo 1 || echo 0)" \
+  "renommage .env impossible : compose.yml, lui, a bien été écrit à jour (état mixte réel)"
+assert_eq "ANCIEN .env" "$(cat "$POC8_WORK/deploy/.env")" \
+  "renommage .env impossible : l'ancien .env reste en place"
+poc8_stdout=$(cat "$POC8_OUT")
+assert_contains "$poc8_stdout" "MIXTE" \
+  "renommage .env impossible : le message dit explicitement l'état mixte"
+assert_contains "$poc8_stdout" "compose.yml a bien" \
+  "renommage .env impossible : le message précise ce qui a réussi"
+leftover8=$(find "$POC8_WORK/deploy" -name '.env.??????' 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "0" "$leftover8" "renommage .env impossible : le fichier temporaire .env est nettoyé"
+
+# --- Non-régression : le suffixe ".env" ne doit pas casser .env.example ----
+# (garde-fou pour ce test lui-même : vérifie que le mv() de substitution ne
+# confond pas les deux fichiers avant de s'y fier pour les preuves 4 et 5)
+POC9_WORK="$WORK/poc9"; mkdir -p "$POC9_WORK"
+rc9=$(_run_gen_compose_broken_mv "$POC9_WORK" "$ENV_FIX" "$SPEC_FIX" "poc9" "/aucun-fichier-ne-finit-comme-ca")
+assert_eq "0" "$rc9" "garde-fou du test : un suffixe qui ne correspond à rien laisse gen_compose réussir normalement"
+assert_eq "1" "$([[ -f "$POC9_WORK/deploy/.env.example" ]] && echo 1 || echo 0)" \
+  "garde-fou du test : .env.example est bien généré (le mv() de substitution ne le bloque pas par erreur)"
+
 finish

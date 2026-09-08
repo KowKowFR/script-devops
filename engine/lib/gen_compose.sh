@@ -120,11 +120,24 @@ gen_compose() {
   local net_name="${APP_NAME}-net"
 
   # Pré-validation (cf. en-tête) : tout se joue ici avant la moindre écriture.
-  local sid
+  # Filet de sécurité (revue round 2, finding A) : `spec_init` doit déjà avoir
+  # rejeté tout id vide/invalide, mais `while read` avec un `[[ -n "$sid" ]]
+  # || continue` peut, par construction, avaler un id en silence si ce filtre
+  # amont venait un jour à régresser. On compte donc les services réellement
+  # validés et on les compare au nombre déclaré par spec.json : un écart est
+  # une erreur fatale, jamais un succès avec un compte de services faux.
+  local total_services
+  total_services="$(jq '.services | length' "$SPEC_JSON")"
+
+  local sid validated_count=0
   while IFS= read -r sid; do
     [[ -n "$sid" ]] || continue
     _gen_compose_validate_service "$sid"
+    validated_count=$((validated_count + 1))
   done < <(spec_service_ids)
+
+  [[ "$validated_count" -eq "$total_services" ]] \
+    || die "génération refusée : spec.json déclare ${total_services} service(s) mais seuls ${validated_count} ont un id exploitable (un service a été ignoré silencieusement — spec_init aurait dû l'empêcher plus tôt)" 2
 
   # Restes d'une génération précédemment interrompue (crash, kill -9…) :
   # nettoyés avant d'en écrire une nouvelle. Les fichiers définitifs, eux, ne
@@ -150,27 +163,41 @@ gen_compose() {
   printf '\nnetworks:\n  %s:\n    driver: bridge\n' "$net_name" >&3
 
   exec 3>&-
-  mv -f "$tmp_compose" "${deploy_dir}/compose.yml"
+  # Le renommage doit être vérifié : un `mv` qui échoue en silence (revue
+  # round 2, finding B) laisse l'ANCIEN compose.yml en place tout en
+  # annonçant un succès plus bas (ui_ok) — un faux succès silencieux, pire
+  # que l'échec lui-même. En cas d'échec : nettoyer le temporaire et mourir
+  # avec un message qui dit explicitement que RIEN n'a encore été écrit.
+  if ! mv -f "$tmp_compose" "${deploy_dir}/compose.yml"; then
+    rm -f "$tmp_compose" 2>/dev/null || true
+    die "compose.yml : échec du renommage atomique vers ${deploy_dir}/compose.yml (rien n'a été modifié sur disque, l'éventuel ancien fichier reste en place)" 2
+  fi
 
   # --- deploy/.env : IMAGE_TAG=latest, écriture atomique --------------------
   local tmp_env
   tmp_env="$(mktemp "${deploy_dir}/.env.XXXXXX")" \
-    || die "deploy/.env : échec de création du fichier temporaire" 2
+    || die "deploy/.env : échec de création du fichier temporaire (compose.yml a déjà été écrit)" 2
   printf 'IMAGE_TAG=latest\n' > "$tmp_env"
   chmod 600 "$tmp_env"
-  mv -f "$tmp_env" "${deploy_dir}/.env"
+  if ! mv -f "$tmp_env" "${deploy_dir}/.env"; then
+    rm -f "$tmp_env" 2>/dev/null || true
+    die "deploy/.env : échec du renommage atomique (état MIXTE : compose.yml a bien été écrit à jour, mais deploy/.env est resté l'ancien fichier — ne pas déployer avant d'avoir corrigé et relancé la génération)" 2
+  fi
 
   # --- deploy/.env.example : committable, écriture atomique -----------------
   local tmp_env_example
   tmp_env_example="$(mktemp "${deploy_dir}/.env.example.XXXXXX")" \
-    || die "deploy/.env.example : échec de création du fichier temporaire" 2
+    || die "deploy/.env.example : échec de création du fichier temporaire (compose.yml et deploy/.env ont déjà été écrits)" 2
   cat > "$tmp_env_example" <<'EOF'
 # Tag des images déployées. Le workflow CI réécrit cette ligne avec le SHA du
 # commit ; y remettre un ancien SHA puis relancer `docker compose up -d` est le
 # mécanisme de rollback.
 IMAGE_TAG=latest
 EOF
-  mv -f "$tmp_env_example" "${deploy_dir}/.env.example"
+  if ! mv -f "$tmp_env_example" "${deploy_dir}/.env.example"; then
+    rm -f "$tmp_env_example" 2>/dev/null || true
+    die "deploy/.env.example : échec du renommage atomique (état MIXTE : compose.yml et deploy/.env ont bien été écrits à jour, seul deploy/.env.example est resté l'ancien fichier — sans conséquence pour un déploiement, mais à corriger avant de committer)" 2
+  fi
 
   ui_ok "deploy/compose.yml généré ($(spec_service_ids | wc -l | tr -d ' ') services)"
 }

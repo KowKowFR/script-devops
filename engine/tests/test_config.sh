@@ -119,6 +119,49 @@ assert_exit_code 0 "spec_init accepte un id de service lettres/chiffres/_/-'" --
   bash -c "source '$RT'; source '$CF'; SPEC_JSON='$GOODID_SPEC'; spec_init"
 rm -f "$GOODID_SPEC"
 
+# ----- Revue round 2, finding A : id de service vide -----------------------
+# Un id vide échoue la regex [A-Za-z0-9_-]+ (le '+' exige au moins un
+# caractère) donc était déjà "détecté" comme invalide — mais join(", ") sur
+# UNE liste contenant UNE seule chaîne vide produit "" : indistinguable de
+# "aucun id invalide" pour un `[[ -z "$bad_ids" ]]`. La décision doit se
+# prendre sur un COMPTE d'éléments, jamais sur le résultat d'un join().
+
+# Preuve 1 : un seul service, id vide.
+EMPTYID_SPEC1=$(mktemp)
+cat > "$EMPTYID_SPEC1" <<'EOF'
+{"name":"poc","services":[{"id":"","image":"alpine"}]}
+EOF
+assert_exit_code 2 "spec_init meurt sur un id de service vide (un seul service)" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$EMPTYID_SPEC1'; spec_init"
+# die()/emit_fail impriment le message JSON sur stdout (contrat du projet).
+empty1_msg=$(bash -c "source '$RT'; source '$CF'; SPEC_JSON='$EMPTYID_SPEC1'; spec_init" 2>/dev/null)
+assert_contains "$empty1_msg" "<vide>" \
+  "message d'id vide lisible ('<vide>', pas un trou dans la phrase)"
+rm -f "$EMPTYID_SPEC1"
+
+# Preuve 2 : deux services déclarés, un seul id vide — vérifie que le cas à
+# UN SEUL élément invalide (même noyé parmi plusieurs services déclarés)
+# n'est plus masqué par le join().
+EMPTYID_SPEC2=$(mktemp)
+cat > "$EMPTYID_SPEC2" <<'EOF'
+{"name":"poc","services":[{"id":"","image":"alpine"},{"id":"good","image":"alpine"}]}
+EOF
+assert_exit_code 2 "spec_init meurt sur un id vide même noyé parmi un id valide (deux services déclarés)" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$EMPTYID_SPEC2'; spec_init"
+rm -f "$EMPTYID_SPEC2"
+
+# Bonus : le même défaut de logique existait, de façon plus discrète, dans le
+# contrôle de DOUBLONS — masqué précisément quand il y a deux ids vides
+# dupliqués (join donne ", ", non vide, donc il "marchait par accident").
+# Toujours vrai après le correctif, testé explicitement pour ne pas régresser.
+DUPEEMPTY_SPEC=$(mktemp)
+cat > "$DUPEEMPTY_SPEC" <<'EOF'
+{"name":"poc","services":[{"id":"","image":"alpine"},{"id":"","image":"alpine"}]}
+EOF
+assert_exit_code 2 "spec_init meurt sur deux ids vides dupliqués (contrôle de doublons)" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$DUPEEMPTY_SPEC'; spec_init"
+rm -f "$DUPEEMPTY_SPEC"
+
 # spec_get doit appliquer le défaut quand le service n'existe pas (finding A)
 assert_eq "mondefaut" "$(run_spec 'spec_get service_inexistant champ mondefaut')" \
   "spec_get applique le défaut quand le service n'existe pas"
