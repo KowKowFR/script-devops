@@ -65,3 +65,54 @@ cfg_port() {
     || die "port hôte hors plage pour '${sid}' : ${port} (attendu 1024-65535)" 2
   printf '%s' "$port"
 }
+
+# ----- Lecture du spec d'application ---------------------------------------
+# spec.json décrit les services de l'application déployée. Il remplace le
+# couple "api + web" codé en dur : une app générée par IA (jalon 5) n'aura pas
+# toujours cette forme.
+
+spec_init() {
+  [[ -f "$SPEC_JSON" ]] || die "spec.json introuvable : ${SPEC_JSON}" 2
+  jq -e . "$SPEC_JSON" >/dev/null 2>&1 || die "spec.json n'est pas du JSON valide" 2
+  jq -e '.services | type == "array" and length > 0' "$SPEC_JSON" >/dev/null 2>&1 \
+    || die "spec.json doit contenir un tableau 'services' non vide" 2
+  local dupes
+  dupes=$(jq -r '[.services[].id] | group_by(.) | map(select(length > 1) | .[0]) | join(",")' "$SPEC_JSON")
+  [[ -z "$dupes" ]] || die "ids de service dupliqués dans spec.json : ${dupes}" 2
+}
+
+spec_service_ids() {
+  jq -r '.services[].id' "$SPEC_JSON"
+}
+
+# spec_get SERVICE_ID CHAMP [DÉFAUT]
+spec_get() {
+  local sid="${1:?}" field="${2:?}" default="${3:-}"
+  local value
+  value=$(jq -r --arg s "$sid" --arg f "$field" '
+    .services[] | select(.id == $s) | .[$f] // empty
+    | if type == "boolean" or type == "number" then tostring else . end
+  ' "$SPEC_JSON" 2>/dev/null || printf '')
+  if [[ -z "$value" ]]; then printf '%s' "$default"; else printf '%s' "$value"; fi
+}
+
+spec_is_internal() {
+  [[ "$(spec_get "${1:?}" internal)" == "true" ]]
+}
+
+spec_is_exposed() {
+  local e
+  e="$(spec_get "${1:?}" expose)"
+  [[ -n "$e" ]]
+}
+
+# Ids exposés triés par longueur de chemin décroissante : le plus spécifique
+# d'abord. Le jalon 4 en dépend (précédence des reverse proxies BunkerWeb) ;
+# autant ne pas dépendre de l'ordre de déclaration dès maintenant.
+spec_exposed_ids_by_path_length() {
+  jq -r '
+    [ .services[] | select((.expose // "") != "") ]
+    | sort_by(-(.expose | length))
+    | .[].id
+  ' "$SPEC_JSON"
+}

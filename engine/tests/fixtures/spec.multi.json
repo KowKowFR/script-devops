@@ -1,0 +1,13 @@
+{
+  "name": "multi-app",
+  "services": [
+    { "id": "api", "build": "./services/api", "port": 3000,
+      "health": "/health", "expose": "/api/",
+      "env": { "NODE_ENV": "production", "DB_HOST": "db" } },
+    { "id": "web", "build": "./services/web", "port": 8080,
+      "health": "/", "expose": "/" },
+    { "id": "db", "image": "postgres:16-alpine", "internal": true,
+      "env": { "POSTGRES_PASSWORD": "changeme" },
+      "volumes": ["pgdata:/var/lib/postgresql/data"] }
+  ]
+}

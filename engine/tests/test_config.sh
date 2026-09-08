@@ -50,4 +50,29 @@ assert_exit_code 2 "cfg_port meurt si le port est absent" -- \
 assert_not_contains "$(cat "$CF")" "ALL_VARS"  "ALL_VARS a disparu"
 assert_not_contains "$(cat "$CF")" "source \"\$ENV_FILE\"" "plus de source du fichier d'env"
 
+# ----- Helpers de lecture du spec -----------------------------------------
+SPEC="$TESTS_DIR/fixtures/spec.multi.json"
+run_spec() { bash -c "source '$RT'; source '$CF'; SPEC_JSON='$SPEC'; $*" 2>/dev/null; }
+
+assert_eq "api web db" "$(run_spec 'spec_service_ids' | tr '\n' ' ' | sed 's/ $//')" \
+  "spec_service_ids liste les trois services"
+assert_eq "3000"  "$(run_spec 'spec_get api port')"           "spec_get lit le port conteneur"
+assert_eq "/api/" "$(run_spec 'spec_get api expose')"         "spec_get lit expose"
+assert_eq "postgres:16-alpine" "$(run_spec 'spec_get db image')" "spec_get lit image"
+assert_eq "repli" "$(run_spec 'spec_get web image repli')"    "spec_get applique le défaut"
+
+assert_exit_code 0 "db est interne"      -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$SPEC'; spec_is_internal db"
+assert_exit_code 1 "api n'est pas interne" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$SPEC'; spec_is_internal api"
+assert_exit_code 0 "api est exposé"      -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$SPEC'; spec_is_exposed api"
+assert_exit_code 1 "db n'est pas exposé"  -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$SPEC'; spec_is_exposed db"
+
+# Le plus spécifique d'abord : /api/ (5 caractères) avant / (1 caractère)
+assert_eq "api web" \
+  "$(run_spec 'spec_exposed_ids_by_path_length' | tr '\n' ' ' | sed 's/ $//')" \
+  "les chemins exposés sont triés du plus spécifique au plus général"
+
 finish

@@ -1,0 +1,20 @@
+{
+  "name": "tp-app",
+  "services": [
+    {
+      "id": "api",
+      "build": "./services/api",
+      "port": 3000,
+      "health": "/health",
+      "expose": "/api/",
+      "env": { "NODE_ENV": "production" }
+    },
+    {
+      "id": "web",
+      "build": "./services/web",
+      "port": 8080,
+      "health": "/",
+      "expose": "/"
+    }
+  ]
+}
