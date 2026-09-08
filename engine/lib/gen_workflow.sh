@@ -5,32 +5,57 @@
 # Usage : gen_workflow.sh WORK_DIR
 #
 # Variables d'environnement :
-#   APP_NAME        (tp-app) — préfixe des images Docker et noms de deployments
-#   OVH_AUTH_METHOD (key)    — "key" (OVH_SSH_KEY) ou "password" (OVH_PASSWORD)
+#   APP_NAME           (tp-app) — préfixe des images Docker
+#   TARGET_AUTH_METHOD (key)    — "key" (TARGET_SSH_KEY) ou "password" (TARGET_PASSWORD)
+#   SPEC_JSON                   — chemin de spec.json (services exposés, health)
+#   ENV_JSON                    — chemin de env.json (ports hôte)
 #
-# Le workflow utilise les secrets configurés côté GitHub (DOCKERHUB_USERNAME, etc.).
+# Le déploiement se fait par Docker Compose (pas Kubernetes) : le job `deploy`
+# se connecte en SSH à la cible, réécrit IMAGE_TAG dans deploy/.env avec le SHA
+# du commit, relance la stack, attend les healthchecks, contrôle la santé
+# applicative (en SSH, sur 127.0.0.1 — jamais via une URL publique, cf.
+# commentaire plus bas) et restaure le tag précédent en cas d'échec.
+#
+# Le workflow utilise les secrets configurés côté GitHub (DOCKERHUB_USERNAME,
+# TARGET_HOST, TARGET_USER, TARGET_SSH_KEY ou TARGET_PASSWORD…), posés par
+# step_github_set_secrets (lib/steps.sh).
 
 set -euo pipefail
 
 WORK_DIR="${1:?WORK_DIR required}"
 APP_NAME="${APP_NAME:-tp-app}"
-OVH_AUTH_METHOD="${OVH_AUTH_METHOD:-key}"
+TARGET_AUTH_METHOD="${TARGET_AUTH_METHOD:-key}"
 
 API_IMAGE="${APP_NAME}-api"
 WEB_IMAGE="${APP_NAME}-web"
-API_DEPLOY="${APP_NAME}-api"
-WEB_DEPLOY="${APP_NAME}-web"
+
+# ----- Contrôle de santé applicatif ------------------------------------------
+# Un curl local par service exposé, enchaînés par && — construit depuis
+# spec.json (quels services sont exposés, sur quel chemin de health-check) et
+# env.json (quel port hôte leur est alloué). Exécuté DEPUIS la cible via SSH :
+# un runner GitHub hébergé ne peut pas joindre une adresse RFC1918, et l'hôte
+# cible n'est plus exposé directement — seul le reverse proxy l'est.
+HEALTH_CHECK_CMDS=""
+if [[ -n "${SPEC_JSON:-}" && -f "$SPEC_JSON" ]]; then
+  while IFS=$'\t' read -r sid health; do
+    port=$(jq -r --arg s "$sid" '.ports[$s] // empty' "${ENV_JSON:-/dev/null}" 2>/dev/null || printf '')
+    [[ -n "$port" ]] || continue
+    [[ -n "$HEALTH_CHECK_CMDS" ]] && HEALTH_CHECK_CMDS+=" && "
+    HEALTH_CHECK_CMDS+="curl -fsS -m 5 -o /dev/null http://127.0.0.1:${port}${health}"
+  done < <(jq -r '.services[] | select((.expose // "") != "") | "\(.id)\t\(.health // "/")"' "$SPEC_JSON")
+fi
+[[ -n "$HEALTH_CHECK_CMDS" ]] || HEALTH_CHECK_CMDS="true"
 
 # ----- Blocs spécifiques au mode d'authentification --------------------------
 # `IFS= read -r -d ''` assigne un heredoc multi-ligne sans backslash hell.
 # - IFS= : conserve les whitespace de début (indentation YAML).
 # - || true : `read` renvoie 1 quand il atteint EOF, normal avec -d ''.
 
-if [[ "$OVH_AUTH_METHOD" == "password" ]]; then
+if [[ "$TARGET_AUTH_METHOD" == "password" ]]; then
   IFS= read -r -d '' SETUP_SSH_BLOCK <<'EOF' || true
       - name: Setup SSH (password mode)
         env:
-          SSH_HOST: ${{ secrets.OVH_HOST }}
+          SSH_HOST: ${{ secrets.TARGET_HOST }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           mkdir -p ~/.ssh
@@ -39,7 +64,7 @@ EOF
 
   IFS= read -r -d '' SSH_ENV <<'EOF' || true
         env:
-          SSHPASS: ${{ secrets.OVH_PASSWORD }}
+          SSHPASS: ${{ secrets.TARGET_PASSWORD }}
 EOF
 
   IFS= read -r -d '' CLEANUP_BLOCK <<'EOF' || true
@@ -49,13 +74,12 @@ EOF
 EOF
 
   SSH_CMD='sshpass -e ssh -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no'
-  SCP_CMD='sshpass -e scp -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no'
 else
   IFS= read -r -d '' SETUP_SSH_BLOCK <<'EOF' || true
       - name: Setup SSH (key mode)
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.OVH_SSH_KEY }}
-          SSH_HOST: ${{ secrets.OVH_HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.TARGET_SSH_KEY }}
+          SSH_HOST: ${{ secrets.TARGET_HOST }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
@@ -73,7 +97,6 @@ EOF
 
   SSH_ENV=''
   SSH_CMD='ssh -i ~/.ssh/deploy_key'
-  SCP_CMD='scp -i ~/.ssh/deploy_key'
 fi
 
 # ----- Génération du fichier ------------------------------------------------
@@ -97,7 +120,6 @@ jobs:
     outputs:
       api: \${{ steps.filter.outputs.api }}
       web: \${{ steps.filter.outputs.web }}
-      manifests: \${{ steps.filter.outputs.manifests }}
     steps:
       - uses: actions/checkout@v4
 
@@ -106,11 +128,9 @@ jobs:
         with:
           filters: |
             api:
-              - 'microservices/api/**'
+              - 'services/api/**'
             web:
-              - 'microservices/web/**'
-            manifests:
-              - 'k8s/**'
+              - 'services/web/**'
 
   # ---- Sécurité : scan secrets dans l'arbre Git (bloquant) ------------------
   scan-secrets:
@@ -136,7 +156,7 @@ jobs:
           password: \${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/build-push-action@v5
         with:
-          context: ./microservices/api
+          context: ./services/api
           push: true
           cache-from: type=gha,scope=api
           cache-to: type=gha,scope=api,mode=max
@@ -174,7 +194,7 @@ jobs:
           password: \${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/build-push-action@v5
         with:
-          context: ./microservices/web
+          context: ./services/web
           push: true
           cache-from: type=gha,scope=web
           cache-to: type=gha,scope=web,mode=max
@@ -196,9 +216,6 @@ jobs:
     if: |
       always() &&
       needs.scan-secrets.result == 'success' &&
-      (needs.detect-changes.outputs.api == 'true' ||
-       needs.detect-changes.outputs.web == 'true' ||
-       needs.detect-changes.outputs.manifests == 'true') &&
       (needs.build-and-push-api.result == 'success' || needs.build-and-push-api.result == 'skipped') &&
       (needs.build-and-push-web.result == 'success' || needs.build-and-push-web.result == 'skipped')
     runs-on: ubuntu-latest
@@ -207,53 +224,58 @@ jobs:
 
 ${SETUP_SSH_BLOCK}
 
-      - name: Apply manifests
+      - name: Déploiement du nouveau tag
 ${SSH_ENV}
         run: |
           ${SSH_CMD} \\
-            \${{ secrets.OVH_USER }}@\${{ secrets.OVH_HOST }} \\
-            'rm -rf ~/tp-k8s-manifests && mkdir -p ~/tp-k8s-manifests'
-          ${SCP_CMD} -r k8s/base \\
-            \${{ secrets.OVH_USER }}@\${{ secrets.OVH_HOST }}:~/tp-k8s-manifests/base
-          ${SSH_CMD} \\
-            \${{ secrets.OVH_USER }}@\${{ secrets.OVH_HOST }} \\
-            "export KUBECONFIG=~/.kube/config && kubectl apply -f ~/tp-k8s-manifests/base/"
+            \${{ secrets.TARGET_USER }}@\${{ secrets.TARGET_HOST }} \\
+            "set -e
+             cd ~/${APP_NAME}/deploy
+             cp .env .env.prev
+             sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=\${{ github.sha }}/' .env
+             docker compose pull
+             docker compose up -d --remove-orphans"
 
-      - name: Deploy API
-        if: needs.detect-changes.outputs.api == 'true'
+      - name: Attente des healthchecks
 ${SSH_ENV}
         run: |
           ${SSH_CMD} \\
-            \${{ secrets.OVH_USER }}@\${{ secrets.OVH_HOST }} \\
-            "export KUBECONFIG=~/.kube/config && \\
-             kubectl set image deployment/${API_DEPLOY} api=\${{ secrets.DOCKERHUB_USERNAME }}/${API_IMAGE}:\${{ github.sha }} && \\
-             kubectl rollout status deployment/${API_DEPLOY} --timeout=2m"
+            \${{ secrets.TARGET_USER }}@\${{ secrets.TARGET_HOST }} \\
+            "cd ~/${APP_NAME}/deploy
+             for i in \\\$(seq 1 30); do
+               bad=\\\$(docker compose ps --format json \\
+                 | jq -rs 'if type==\"array\" then . else [.] end
+                           | map(select(.State != \"running\" or ((.Health // \"\") == \"unhealthy\")))
+                           | length')
+               [ \\\"\\\$bad\\\" = \\\"0\\\" ] && exit 0
+               sleep 3
+             done
+             echo 'healthchecks non satisfaits après 90s' >&2
+             exit 1"
 
-      - name: Deploy Web
-        if: needs.detect-changes.outputs.web == 'true'
+      # Le health-check passe par SSH sur l'hôte cible, jamais par une URL
+      # publique : un runner GitHub hébergé ne peut pas joindre une adresse
+      # RFC1918, et l'hôte cible n'est plus exposé directement.
+      - name: Contrôle de santé applicatif
 ${SSH_ENV}
         run: |
           ${SSH_CMD} \\
-            \${{ secrets.OVH_USER }}@\${{ secrets.OVH_HOST }} \\
-            "export KUBECONFIG=~/.kube/config && \\
-             kubectl set image deployment/${WEB_DEPLOY} web=\${{ secrets.DOCKERHUB_USERNAME }}/${WEB_IMAGE}:\${{ github.sha }} && \\
-             kubectl rollout status deployment/${WEB_DEPLOY} --timeout=2m"
+            \${{ secrets.TARGET_USER }}@\${{ secrets.TARGET_HOST }} \\
+            "${HEALTH_CHECK_CMDS}"
 
-      - name: Post-deploy health check
+      - name: Rollback si échec
+        if: failure()
+${SSH_ENV}
         run: |
-          for i in {1..15}; do
-            if curl -fsS -m 5 "http://\${{ secrets.OVH_HOST }}/api/health" > /tmp/health.json 2>/dev/null; then
-              echo "Health check passed"
-              cat /tmp/health.json
-              exit 0
-            fi
-            echo "  retry \$i/15…"
-            sleep 4
-          done
-          echo "Health check failed"
-          exit 1
+          ${SSH_CMD} \\
+            \${{ secrets.TARGET_USER }}@\${{ secrets.TARGET_HOST }} \\
+            "set -e
+             cd ~/${APP_NAME}/deploy
+             [ -f .env.prev ] && mv .env.prev .env
+             docker compose pull && docker compose up -d --remove-orphans
+             echo 'rollback effectué vers le tag précédent'"
 
 ${CLEANUP_BLOCK}
 EOF
 
-echo "  - .github/workflows/deploy.yml (auth=${OVH_AUTH_METHOD}, images: ${API_IMAGE}/${WEB_IMAGE})"
+echo "  - .github/workflows/deploy.yml (auth=${TARGET_AUTH_METHOD}, images: ${API_IMAGE}/${WEB_IMAGE})"

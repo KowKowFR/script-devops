@@ -81,12 +81,15 @@ step_generate_skills() {
 }
 
 step_generate_workflow() {
-  # gen_workflow.sh (script autonome, hors périmètre de cette tâche) attend
-  # son mode d'authentification sous son propre nom de variable historique :
-  # on le lui fournit depuis target.auth_method, sans le convertir lui-même.
+  # gen_workflow.sh attend son mode d'authentification sous TARGET_AUTH_METHOD
+  # (renommé depuis OVH_AUTH_METHOD — le vestige Kubernetes a disparu des deux
+  # côtés en même temps, pour ne jamais retomber silencieusement sur le mode
+  # "key" par défaut). SPEC_JSON/ENV_JSON lui servent à construire le contrôle
+  # de santé (un curl par service exposé, sur son port hôte).
   APP_NAME="$APP_NAME" \
-  OVH_AUTH_METHOD="$(cfg target.auth_method key)" \
+  TARGET_AUTH_METHOD="$(cfg target.auth_method key)" \
   SPEC_JSON="$SPEC_JSON" \
+  ENV_JSON="$ENV_JSON" \
     bash "$(dirname "${BASH_SOURCE[0]}")/gen_workflow.sh" "$WORK_DIR" >&2
   emit_ok "$(jq -cn --arg f "$WORK_DIR/.github/workflows/deploy.yml" '{workflow: $f}')"
 }
@@ -236,4 +239,113 @@ step_validate_deployment() {
   done
 
   emit_ok "$(jq -cn --argjson n "$checked" '{services_ok: $n}')"
+}
+
+# ----- Bloc GitHub (optionnel) ----------------------------------------------
+# Décision d'architecture : GitHub est un extra, pas le chemin de déploiement.
+# Le panel déploie lui-même (build_images + deploy_stack). Une panne GitHub ne
+# doit jamais empêcher une application de tourner — d'où la position de ce bloc
+# en fin de séquence, et le court-circuit ci-dessous.
+
+_github_skip_if_disabled() {
+  if ! cfg_bool github.enabled; then
+    ui_skip "bloc GitHub désactivé (github.enabled=false)"
+    emit_ok '{"skipped":true}'
+    return 0
+  fi
+  return 1
+}
+
+_gh() {
+  # gh s'authentifie par GH_TOKEN, jamais par `gh auth login` (interactif).
+  GH_TOKEN="$(cfg_req github.token)" gh "$@"
+}
+
+step_github_create_repo() {
+  _github_skip_if_disabled && return 0
+  local repo; repo="$(cfg_req github.user)/$(cfg_req github.repo)"
+
+  if _gh repo view "$repo" >/dev/null 2>&1; then
+    if cfg_bool options.allow_existing_repo; then
+      ui_ok "Dépôt existant réutilisé : ${repo}"
+      emit_ok "$(jq -cn --arg r "$repo" '{repo: $r, created: false}')"
+      return 0
+    fi
+    die "le dépôt ${repo} existe déjà et options.allow_existing_repo est faux" 2
+  fi
+
+  _gh repo create "$repo" --public \
+    --description "Déployé par DeployMatic" >&2 \
+    || retryable "création du dépôt ${repo} impossible"
+  ui_ok "Dépôt créé : https://github.com/${repo}"
+  emit_ok "$(jq -cn --arg r "$repo" '{repo: $r, created: true}')"
+}
+
+step_github_set_secrets() {
+  _github_skip_if_disabled && return 0
+  local repo; repo="$(cfg_req github.user)/$(cfg_req github.repo)"
+
+  local n=0
+  _gh secret set DOCKERHUB_USERNAME --repo "$repo" --body "$(cfg_req registry.user)" >&2 && n=$((n+1))
+  _gh secret set DOCKERHUB_TOKEN    --repo "$repo" --body "$(cfg_req registry.token)" >&2 && n=$((n+1))
+  _gh secret set TARGET_HOST        --repo "$repo" --body "$(cfg_req target.host)" >&2 && n=$((n+1))
+  _gh secret set TARGET_USER        --repo "$repo" --body "$(cfg_req target.user)" >&2 && n=$((n+1))
+
+  if [[ "$(cfg target.auth_method key)" == "password" ]]; then
+    _gh secret set TARGET_PASSWORD --repo "$repo" --body "$(cfg_req target.password)" >&2 && n=$((n+1))
+  else
+    local key_path; key_path="$(cfg_req target.ssh_key_path)"
+    ssh-keygen -y -f "$key_path" >/dev/null 2>&1 \
+      || die "clé SSH invalide ou protégée par passphrase : ${key_path} (le runner CI ne peut pas la déverrouiller)" 2
+    # Une clé sans saut de ligne final provoque "error in libcrypto" côté runner.
+    local tmp; tmp=$(mktemp)
+    cat "$key_path" > "$tmp"
+    [[ -z "$(tail -c1 "$tmp")" ]] || printf '\n' >> "$tmp"
+    _gh secret set TARGET_SSH_KEY --repo "$repo" < "$tmp" >&2 && n=$((n+1))
+    rm -f "$tmp"
+  fi
+
+  ui_ok "${n} secrets configurés"
+  emit_ok "$(jq -cn --argjson n "$n" '{secrets: $n}')"
+}
+
+step_git_init() {
+  _github_skip_if_disabled && return 0
+  local url="https://github.com/$(cfg_req github.user)/$(cfg_req github.repo).git"
+  (
+    cd "$WORK_DIR" || exit 1
+    [[ -d .git ]] || git init -q -b main
+    cat > .gitignore <<'GITIGNORE'
+node_modules/
+npm-debug.log
+*.log
+.DS_Store
+.vscode/
+.idea/
+deploy/.env
+GITIGNORE
+    git remote add origin "$url" 2>/dev/null || git remote set-url origin "$url"
+  ) >&2 || retryable "initialisation git impossible dans ${WORK_DIR}"
+
+  ui_ok "Dépôt local initialisé, origin → ${url}"
+  emit_ok "$(jq -cn --arg u "$url" '{remote: $u}')"
+}
+
+step_git_push() {
+  _github_skip_if_disabled && return 0
+  local user; user="$(cfg_req github.user)"
+  (
+    cd "$WORK_DIR" || exit 1
+    git add .
+    if git diff --cached --quiet; then
+      echo "aucun changement à commiter" >&2
+    else
+      git -c user.email="${user}@users.noreply.github.com" -c user.name="$user" \
+          commit -q -m "chore: déploiement initial par DeployMatic"
+    fi
+    GH_TOKEN="$(cfg_req github.token)" git push -u origin main
+  ) >&2 || retryable "push vers origin/main impossible"
+
+  ui_ok "Push réussi"
+  emit_ok "$(jq -cn --arg u "https://github.com/${user}/$(cfg_req github.repo)" '{repo_url: $u}')"
 }

@@ -23,7 +23,7 @@ mkdir -p "$SKILLS_DIR/microservice-editor"
 cat > "$SKILLS_DIR/microservice-editor/SKILL.md" <<'EOF'
 ---
 name: microservice-editor
-description: Use this skill when the user wants to modify, add, or remove code in the microservices (Express API at microservices/api/server.js or static frontend at microservices/web/index.html). Triggers include "add a route", "modify the API", "add an endpoint", "change the home page", "ajoute une route", "modifie l'API". This skill knows the structure of both microservices and applies changes idiomatically.
+description: Use this skill when the user wants to modify, add, or remove code in the microservices (Express API at services/api/server.js or static frontend at services/web/index.html). Triggers include "add a route", "modify the API", "add an endpoint", "change the home page", "ajoute une route", "modifie l'API". This skill knows the structure of both microservices and applies changes idiomatically.
 ---
 
 # microservice-editor
@@ -32,11 +32,11 @@ This skill modifies the application code (API or Web) in this project.
 
 ## Project structure
 
-- `microservices/api/server.js` — Express.js API
+- `services/api/server.js` — Express.js API
   - Routes already present: `GET /`, `GET /health`, `GET /info`
   - Convention: use `res.json(...)` for responses
   - Health-check must always remain at `GET /health` and return `{ status: "ok", ... }`
-- `microservices/web/index.html` — static frontend served by nginx
+- `services/web/index.html` — static frontend served by nginx
   - Single-page HTML with CSS variables for theming
 
 ## Workflow
@@ -85,8 +85,8 @@ Commit changes and push to the `main` branch.
 1. Run `git status` to see what changed.
 2. If nothing changed, report and stop.
 3. Categorize the changes:
-   - Changes in `microservices/api/` → scope `api`
-   - Changes in `microservices/web/` → scope `web`
+   - Changes in `services/api/` → scope `api`
+   - Changes in `services/web/` → scope `web`
    - Changes in `deploy/` → scope `deploy`
    - Changes in `.github/workflows/` → scope `ci`
    - Changes in `.agents/skills/` → scope `skills`

@@ -40,5 +40,19 @@ out=$(bash "$BS" --workspace test-dispatch --step validate_ssh --dry-run 2>/dev/
 assert_valid_json "$out" "--dry-run produit du JSON"
 assert_eq "true" "$(printf '%s' "$out" | jq -r .ok)" "--dry-run réussit sans rien faire"
 
+# ==========================================================================
+# Preuve 1 — bloc GitHub optionnel : github.enabled=false (fixture env.min)
+# court-circuite les 4 étapes en emit_ok {"skipped":true}, jamais en échec.
+# Une panne GitHub ne doit jamais empêcher un déploiement d'aboutir.
+# ==========================================================================
+for gh_step in github_create_repo github_set_secrets git_init git_push; do
+  out=$(bash "$BS" --workspace test-dispatch --step "$gh_step" 2>/dev/null)
+  assert_valid_json "$out" "${gh_step} (github.enabled=false) : produit du JSON"
+  assert_eq "true" "$(printf '%s' "$out" | jq -r .ok)" \
+    "${gh_step} (github.enabled=false) : ok=true (pas un échec)"
+  assert_eq "true" "$(printf '%s' "$out" | jq -r .data.skipped)" \
+    "${gh_step} (github.enabled=false) : data.skipped=true"
+done
+
 rm -rf "$REPO_ROOT/runs/test-dispatch"
 finish
