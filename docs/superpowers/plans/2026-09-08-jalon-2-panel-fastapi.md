@@ -97,6 +97,7 @@ bootstrap-tp/
 │   ├── auth.py                  [NOUVEAU] argon2, session signée HMAC, compte admin
 │   ├── security.py              [NOUVEAU] dépendances FastAPI : session, CSRF, Origin, rate limit
 │   ├── runspace.py              [NOUVEAU] runs/<slug>/ : env.json + spec.json en 600
+│   ├── ssh_check.py             [NOUVEAU] test de connexion SSH d'une cible (côté panel)
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── app.py               [NOUVEAU] création de l'app FastAPI, lifespan, /healthz, /readyz
@@ -123,9 +124,14 @@ bootstrap-tp/
 │   ├── test_pipeline.py         test_auth.py         test_security.py
 │   ├── test_api_targets.py      test_api_apps.py     test_api_runs.py
 │   ├── test_runspace.py         test_engine_call.py  test_logbus.py
-│   ├── test_runner.py           test_reconcile.py
-│   └── fixtures/fake_engine.sh  [NOUVEAU] faux engine scriptable : codes 0/1/2, stdout/stderr
+│   ├── test_runner.py           test_reconcile.py    test_steps_py.py
+│   ├── test_api_health.py       test_api_auth.py     test_ui.py
+│   ├── fixtures/fake_engine.sh  [NOUVEAU] faux engine scriptable : codes 0/1/2, stdout/stderr
+│   └── integration/             [NOUVEAU] marqué `integration`, exclu par défaut :
+│                                déploiement réel sur la VM Lima (Task 22)
 ├── runs/                        volume partagé panel ↔ worker (gitignoré, 700)
+├── secrets/                     [NOUVEAU] secrets Docker locaux (gitignoré, 700) :
+│                                panel_secret_key, worker_ssh_key
 ├── docs/
 │   ├── PANEL.md                 [NOUVEAU] exploitation : variables, secrets, mise derrière BunkerWeb
 │   └── JALON-2-VERIFICATION.md  [NOUVEAU] état de vérification des 8 critères
@@ -150,6 +156,21 @@ bootstrap-tp/
 | 11 | `deploy_stack` | engine | toujours | |
 | 12 | `validate_deployment` | engine | toujours | |
 | 13 | `github_create_repo` | engine | si `ok` → `skipped` | `requires_flag="github.enabled"` |
+
+> **Correction du contrôleur, 8 septembre 2026.** La justification ci-dessus est
+> factuellement fausse : les quatre fonctions `step_github_create_repo`,
+> `step_github_set_secrets`, `step_git_init` et `step_git_push` **existent bien**
+> dans `engine/lib/steps.sh` depuis la tâche 12 du jalon 1, et court-circuitent
+> proprement quand `github.enabled` vaut faux — vérifié par exécution réelle :
+> les quatre rendent `{"ok":true,"data":{"skipped":true}}`. L'agent qui a rédigé
+> ce plan avait lu un état antérieur du fichier.
+>
+> **Le champ `requires_flag` reste néanmoins la bonne conception**, pour une
+> raison différente de celle avancée : il rend la condition d'exécution visible
+> côté panneau, donc affichable dans l'UI et testable sans lancer l'engine. Ne le
+> supprimez pas, mais ne le présentez pas comme un contournement d'une lacune de
+> l'engine — il n'y en a pas.
+
 | 14 | `github_set_secrets` | engine | si `ok` → `skipped` | `requires_flag="github.enabled"` |
 | 15 | `git_init` | engine | si `ok` → `skipped` | `requires_flag="github.enabled"` |
 | 16 | `git_push` | engine | si `ok` → `skipped` | `requires_flag="github.enabled"` |
@@ -5357,3 +5378,515 @@ git commit -m "docs(panel): exploitation, mise derrière BunkerWeb, pytest dans 
 ```
 
 ---
+
+## Task 24: Recette — passer les huit critères un par un et déclarer ce qui n'est pas vérifié
+
+**Files:**
+- Create: `docs/JALON-2-VERIFICATION.md`, `tests/test_mutation_report.md`
+- Modify: aucun code.
+
+**Interfaces:**
+- Consumes: tout ce qui précède, la stack debout, la VM Lima démarrée.
+- Produces: un document daté qui dit, critère par critère, ce qui a été vérifié, **comment**, et ce qui ne l'a pas été. Le jalon 1 a montré la valeur de cette honnêteté : son critère n°6 était déclaré non vérifiable, ce qui a mené à la création de la cible de test.
+
+**Cette tâche se fait à deux** (Panel + Infra), en une session, sur une machine où la stack n'a jamais tourné — le critère n°1 dit « machine vierge », et une machine qui a déjà servi ment sur les prérequis manquants.
+
+- [ ] **Step 1: Repartir de zéro**
+
+```bash
+docker compose down -v --remove-orphans
+rm -rf runs/* secrets/ .env
+docker image rm deploymatic-panel:latest 2>/dev/null || true
+engine/tools/test-target.sh down && engine/tools/test-target.sh up
+```
+
+- [ ] **Step 2: Dérouler les huit critères**
+
+Le script de recette complet est dans la section « Critères d'acceptation » ci-dessous. Le lancer **commande par commande**, en lisant chaque sortie — pas en le pipant dans un fichier qu'on ne relira pas.
+
+- [ ] **Step 3: Consigner la vérification par mutation**
+
+Créer `tests/test_mutation_report.md` : pour chaque mutation listée dans les tâches 2, 4, 6, 7, 9, 11, 12, 14, 16 et 17, une ligne — la mutation appliquée, le test qui a rougi, et la date. **Toute mutation qui n'a fait rougir aucun test est un défaut de test à corriger avant de clore le jalon**, pas une ligne à rayer.
+
+```markdown
+| Tâche | Mutation appliquée | Test qui a rougi | État |
+|---|---|---|---|
+| 4 | `APP_NAME_PATTERN` sans ancre `$` | `test_noms_invalides[mon-app\n]` | ✅ |
+| 7 | `require_csrf` → `return` | 4 tests de `test_security` | ✅ |
+| … | … | … | … |
+```
+
+- [ ] **Step 4: Écrire `docs/JALON-2-VERIFICATION.md`**
+
+```markdown
+# Jalon 2 — état de vérification
+
+_Daté du <jour>. Vérifié sur <machine>, cible Lima Ubuntu 24.04 sur 127.0.0.1:60122._
+
+| # | Critère | État | Comment |
+|---|---|---|---|
+| 1 | `docker compose up -d` puis une URL qui répond, sur machine vierge | | |
+| 2 | Une requête non authentifiée renvoie 401 | | |
+| 3 | Un POST sans token CSRF est rejeté | | |
+| 4 | Un nom d'app invalide est rejeté par l'API | | |
+| 5 | Déploiement complet de l'app de démo, logs en direct | | |
+| 6 | `docker compose restart worker` pendant un run → `failed`, pas bloqué | | |
+| 7 | Aucun secret en clair dans `SELECT * FROM app` | | |
+| 8 | `pytest` : auth, validation de nom, réconciliation | | |
+
+## Ce qui n'a pas été vérifié, et pourquoi
+
+(À remplir honnêtement. Si tout est vert, le dire ; si quelque chose ne l'est
+pas, dire ce qui a été fait à la place et ce qu'il reste à exercer, comme
+`docs/JALON-1-VERIFICATION.md` l'a fait pour son critère 6.)
+
+## Dette laissée au jalon 3
+
+- Le verrou « un seul run actif par app » est une garde applicative, pas un
+  verrou en base : à remplacer quand plusieurs workers tourneront.
+- Pas d'Alembic : `create_all()` suffit tant que le schéma ne change pas. La
+  table `PortAllocation` du jalon 3 est le bon moment pour l'introduire.
+- `App.env.ports` est saisi à la main : l'allocateur du jalon 3 le remplit.
+- La fenêtre de rate limiting est fixe, pas glissante (cf. Task 7).
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add docs/JALON-2-VERIFICATION.md tests/test_mutation_report.md
+git commit -m "docs: état de vérification du jalon 2 et rapport de vérification par mutation"
+```
+
+---
+
+# Critères d'acceptation
+
+Les huit critères de `docs/ROADMAP.md`, chacun rendu vérifiable par une commande.
+Préalables communs : la stack est debout (`docker compose up -d`), la VM de test
+tourne (`engine/tools/test-target.sh up`), et `$MDP` porte la valeur de
+`PANEL_ADMIN_PASSWORD`.
+
+```bash
+export BASE=http://127.0.0.1:8080
+export MDP="$(grep '^PANEL_ADMIN_PASSWORD=' .env | cut -d= -f2-)"
+```
+
+## 1. `docker compose up -d` puis une URL qui répond, sur une machine vierge
+
+```bash
+docker compose down -v --remove-orphans && rm -rf runs/* && docker compose up -d --build
+sleep 30
+docker compose ps --format '{{.Service}}\t{{.Status}}'
+curl -sf $BASE/healthz && echo
+curl -sf $BASE/readyz && echo
+curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' $BASE/
+```
+
+**Attendu** : les quatre services en `(healthy)` ; `{"status":"ok"}` ;
+`{"database":true,"redis":true}` ; `302` vers `/login`.
+
+## 2. Login obligatoire — une requête non authentifiée renvoie 401
+
+```bash
+for chemin in /api/apps /api/targets /api/runs/1 /api/runs/1/events; do
+  printf '%-24s %s\n' "$chemin" "$(curl -s -o /dev/null -w '%{http_code}' $BASE$chemin)"
+done
+curl -s -o /dev/null -w 'ecran /apps : %{http_code}\n' $BASE/apps
+```
+
+**Attendu** : `401` sur les quatre routes d'API ; `302` (vers `/login`) sur l'écran.
+Un `200` où que ce soit est un échec du critère.
+
+## 3. Un POST sans token CSRF est rejeté
+
+```bash
+rm -f /tmp/dm.jar
+CSRF=$(curl -s -c /tmp/dm.jar $BASE/api/csrf | jq -r .csrf)
+curl -s -b /tmp/dm.jar -c /tmp/dm.jar -X POST $BASE/api/login \
+  -H 'Content-Type: application/json' -H "Origin: $BASE" -H "X-CSRF-Token: $CSRF" \
+  -d "{\"username\":\"admin\",\"password\":\"$MDP\"}" -o /dev/null -w 'login : %{http_code}\n'
+CSRF=$(curl -s -b /tmp/dm.jar -c /tmp/dm.jar $BASE/api/csrf | jq -r .csrf)
+
+echo "--- sans token CSRF ---"
+curl -s -b /tmp/dm.jar -X POST $BASE/api/targets -H 'Content-Type: application/json' \
+  -H "Origin: $BASE" -d '{}' -o /dev/null -w '%{http_code}\n'
+echo "--- avec un mauvais token ---"
+curl -s -b /tmp/dm.jar -X POST $BASE/api/targets -H 'Content-Type: application/json' \
+  -H "Origin: $BASE" -H 'X-CSRF-Token: nimportequoi' -d '{}' -o /dev/null -w '%{http_code}\n'
+echo "--- avec un Origin étranger ---"
+curl -s -b /tmp/dm.jar -X POST $BASE/api/targets -H 'Content-Type: application/json' \
+  -H 'Origin: https://evil.example' -H "X-CSRF-Token: $CSRF" -d '{}' -o /dev/null -w '%{http_code}\n'
+echo "--- sans Origin du tout ---"
+curl -s -b /tmp/dm.jar -X POST $BASE/api/targets -H 'Content-Type: application/json' \
+  -H "X-CSRF-Token: $CSRF" -d '{}' -o /dev/null -w '%{http_code}\n'
+```
+
+**Attendu** : `204` au login, puis **`403` quatre fois**. Un `422` (corps invalide)
+au lieu d'un `403` signifierait que la requête a franchi la garde CSRF avant la
+validation du corps — c'est un échec, l'ordre des dépendances est mauvais.
+
+## 4. Un nom d'application invalide est rejeté par l'API
+
+```bash
+for nom in '../foo' '..' '/etc/passwd' 'A_b' 'MonApp' '1app' 'a' \
+           'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'mon app' 'mon.app' 'mon;app'; do
+  code=$(curl -s -b /tmp/dm.jar -X POST $BASE/api/apps \
+    -H 'Content-Type: application/json' -H "Origin: $BASE" -H "X-CSRF-Token: $CSRF" \
+    -d "{\"target_id\":1,\"spec\":{\"name\":\"$nom\",\"services\":[{\"id\":\"api\",\"build\":\"./a\",\"port\":3000,\"expose\":\"/\"}]}}" \
+    -o /dev/null -w '%{http_code}')
+  printf '%-34s %s\n' "$nom" "$code"
+done
+echo "--- et aucun répertoire n'a été créé hors de runs/ ---"
+ls -a runs/ && ls -a /tmp | grep -i foo || echo "OK"
+```
+
+**Attendu** : `422` sur les onze noms, et `runs/` ne contient rien de nouveau.
+
+## 5. Un déploiement complet de l'app de démo passe, logs visibles en direct
+
+```bash
+engine/tools/test-target.sh status          # attendu : Running, 127.0.0.1:60122
+.venv/bin/python -m pytest tests/integration -m integration -q -s
+```
+
+Et la vérification que les logs arrivent **en direct**, pas à la fin — le
+critère dit « visibles en direct », ce qu'un test d'API ne prouve pas :
+
+```bash
+# Dans un terminal : suivre le flux pendant qu'un run tourne.
+curl -N -b /tmp/dm.jar $BASE/api/runs/$RUN_ID/events | \
+  while IFS= read -r l; do printf '%s %s\n' "$(date +%T)" "$l"; done
+```
+
+**Attendu** : les 4 tests d'intégration verts, et surtout des horodatages
+**échelonnés** dans la sortie `curl -N` — si toutes les lignes arrivent à la même
+seconde, à la fin du run, le streaming ne fonctionne pas (tamponnage du proxy,
+ou stderr lu après `wait` dans `panel/worker/engine.py`).
+
+## 6. `docker compose restart worker` pendant un run laisse le run `failed`
+
+C'est le critère qui valide D4, et il se teste à deux : l'un lance, l'autre coupe.
+
+```bash
+RUN_ID=$(curl -s -b /tmp/dm.jar -X POST $BASE/api/apps/1/deploy \
+  -H "Origin: $BASE" -H "X-CSRF-Token: $CSRF" | jq -r .run_id)
+
+# Attendre que le run soit VRAIMENT en cours (pas encore queued).
+until [ "$(curl -s -b /tmp/dm.jar $BASE/api/runs/$RUN_ID | jq -r .status)" = "running" ]; do
+  sleep 1
+done
+
+docker compose restart worker
+sleep 20
+
+curl -s -b /tmp/dm.jar $BASE/api/runs/$RUN_ID | jq '{status, error}'
+curl -s -b /tmp/dm.jar $BASE/api/runs/$RUN_ID \
+  | jq '[.steps[] | select(.status=="running")] | length'
+docker compose logs worker --since 1m | grep -i "réconciliation"
+```
+
+**Attendu** : `status` vaut `"failed"`, `error` contient « le job RQ … n'existe
+plus », **zéro** étape restée en `running`, et une ligne de log de réconciliation.
+Un `status` resté à `"running"` est l'échec exact que D4 existe pour empêcher.
+
+Variante à faire aussi, parce qu'elle emprunte l'autre chemin d'appel :
+
+```bash
+# Même scénario, mais on redémarre le PANEL au lieu du worker : la
+# réconciliation du lifespan doit faire le même travail.
+docker compose stop worker && docker compose restart panel && sleep 15
+curl -s -b /tmp/dm.jar $BASE/api/runs/$RUN_ID | jq -r .status   # attendu : failed
+docker compose start worker
+```
+
+## 7. Aucun secret en clair dans une requête `SELECT * FROM app`
+
+```bash
+docker compose exec -T postgres psql -U panel -d panel -c 'SELECT * FROM app;' \
+  | grep -E 'dckr_pat_|ghp_|BEGIN OPENSSH' && echo "ÉCHEC" || echo "OK : rien en clair"
+
+docker compose exec -T postgres psql -U panel -d panel -c 'SELECT * FROM target;' \
+  | grep -E 'dckr_pat_|BEGIN OPENSSH' && echo "ÉCHEC" || echo "OK : rien en clair"
+
+echo "--- et les colonnes chiffrées le sont bien (en-tête Fernet) ---"
+docker compose exec -T postgres psql -U panel -d panel -tAc \
+  "SELECT left(secrets_enc, 6) FROM app WHERE secrets_enc IS NOT NULL;"
+
+echo "--- ni dans les journaux de run, ni dans les réponses d'API ---"
+grep -rE 'dckr_pat_|ghp_|BEGIN OPENSSH' runs/*/logs/ && echo "ÉCHEC" || echo "OK"
+curl -s -b /tmp/dm.jar $BASE/api/apps | grep -E 'secrets_enc|password' \
+  && echo "ÉCHEC" || echo "OK : aucun champ secret dans la réponse"
+```
+
+**Attendu** : `OK` partout, et l'en-tête `gAAAAA` sur les colonnes chiffrées.
+
+## 8. `pytest` : au moins les tests d'auth, de validation de nom, et de réconciliation
+
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q tests/test_auth.py tests/test_security.py \
+                              tests/test_api_auth.py tests/test_spec.py \
+                              tests/test_api_apps.py tests/test_reconcile.py
+echo "--- et la suite bash de l'engine ne doit pas avoir régressé ---"
+bash engine/tests/run.sh | tail -3
+```
+
+**Attendu** : tout vert, la suite bash toujours à `TOUT PASSE`. Et le rapport de
+mutation (`tests/test_mutation_report.md`) sans aucune ligne « aucun test n'a
+rougi » — une telle ligne invalide le critère, quel que soit le nombre de tests
+verts.
+
+## Deux vérifications qui ne sont pas dans la feuille de route mais devraient l'être
+
+```bash
+echo "--- le socket Docker n'est monté nulle part ---"
+docker inspect $(docker compose ps -q) \
+  --format '{{.Name}} {{range .Mounts}}{{.Source}}→{{.Destination}} {{end}}' \
+  | grep docker.sock && echo "ÉCHEC" || echo "OK"
+
+echo "--- le port du panneau n'est pas exposé hors de la loopback ---"
+docker compose port panel 8000            # attendu : 127.0.0.1:8080
+docker inspect deploymatic-panel-1 \
+  --format '{{json .NetworkSettings.Ports}}' | jq
+```
+
+---
+
+# Découpage par rôle
+
+Aligné sur `docs/TEAM-SPLIT.md` §5 (Panel / Python 65 %, Infra & Sécurité 25 %,
+Engine / Bash 10 %).
+
+## Panel / Python — tâches 1 à 19, 22 et 24
+
+| Lot | Tâches | Dépend de |
+|---|---|---|
+| Fondations | 1 (squelette, settings), 2 (crypto), 3 (modèles + db) | **rien** |
+| Validation | 4 (`AppSpec`, nom d'app), 5 (pipeline) | 3 · pour la 5 : `--list-steps` de l'engine |
+| Sécurité applicative | 6 (argon2, session), 7 (CSRF, Origin, rate limit) | 1, 3 |
+| API | 8 (app + santé), 9 (login), 10 (cibles), 11 (apps + deploy) | 3, 6, 7 · la 8 consomme la 17 |
+| Exécution | 12 (runspace), 13 (logbus), 14 (appel engine), 15 (étapes Python), 16 (runner), 17 (réconciliation) | **C1 et C2 figés** |
+| Restitution | 18 (SSE), 19 (frontend) | 13, 16 |
+| Recette | 22 (intégration réelle), 24 (critères) | tout |
+
+## Infra & Sécurité — tâches 20, 21, 23, et co-pilotage de 22 et 24
+
+| Lot | Tâches | Dépend de |
+|---|---|---|
+| Image | 20 (`Dockerfile`, UID 10001, outils de l'engine) | `pyproject.toml` (Task 1) |
+| Stack | 21 (`compose.yml`, secrets, durcissement, healthchecks) | 20 · **C7 figé** |
+| Exploitation et CI | 23 (`docs/PANEL.md`, README, `pytest` en CI) | 21 |
+| Recette à deux | 22, 24 | tout |
+
+## Engine / Bash — 10 %, en soutien
+
+Ce rôle n'a **aucune tâche de ce plan**. Son travail pendant le jalon 2 :
+
+1. **Terminer la tâche 12 du jalon 1** — les quatre `step_github_*` sont listées
+   par `--list-steps` mais aucune n'est implémentée dans `engine/lib/steps.sh`.
+   Le pipeline les neutralise par `requires_flag` (Task 5), donc **rien n'est
+   bloqué** ; mais tant que ce n'est pas fait, `github.enabled: true` casse un run.
+2. **Répondre aux découvertes de l'intégration** : le worker est le premier vrai
+   consommateur du contrat C1, et le premier consommateur trouve toujours
+   quelque chose. Le canal est le journal de run, qui contient déjà tout stderr.
+3. **La dette de test reportée du jalon 1** : pureté stdout des `ui_*` et de
+   `check_prereqs`. C'est l'invariant dont dépend `panel/worker/engine.py`, et il
+   n'a aujourd'hui aucune garde en régression — une étape qui `echo` un résumé
+   sur stdout casserait le parsing du worker sans qu'aucun test bash ne rougisse.
+4. **Avance sur le jalon 3** : `step_open_firewall_ports` / `step_close_firewall_ports`
+   et les étapes de `destroy`, qui ne dépendent que d'`env.json`.
+
+## Ce qui se parallélise
+
+✅ **Les deux premières semaines se parallélisent presque entièrement.**
+
+- **Tâches 1 à 7** (fondations, validation, sécurité applicative) ne dépendent
+  d'**aucun** contrat avec l'engine ni avec l'infra. Le rôle Panel peut les
+  enchaîner sans parler à personne.
+- **Tâches 20 et 21** (image, stack) ne dépendent pas du **contenu** de `panel/`,
+  seulement de **C7** : nom de l'image, chemin du volume `runs/`, UID, noms des
+  variables d'environnement, chemins des secrets. Une demi-heure de discussion
+  en début de jalon débloque toute la voie Infra.
+- **Tâches 13, 14 et 15** (logbus, appel engine, étapes Python) sont
+  indépendantes les unes des autres : trois modules, trois fichiers de test,
+  aucune écriture partagée. Elles se prennent à trois si l'équipe le permet.
+- **Tâche 19** (frontend) ne dépend que des **formes de réponse** de l'API, pas
+  de son implémentation : elle démarre dès que `schemas.py` (Task 9) est figé.
+- **Tâche 5** (pipeline) est le seul point de contact avec l'engine, et il est
+  en lecture seule : `--list-steps` existe déjà et fonctionne.
+
+## Ce qui ne se parallélise pas
+
+❌ **La chaîne 12 → 14 → 16 est strictement séquentielle.** Le runner (16)
+consomme `runspace` (12), `engine.py` (14), `logbus` (13) et `steps_py` (15) ;
+l'écrire pendant que l'un des quatre bouge, c'est le réécrire. Une seule
+personne, dans cet ordre.
+
+❌ **Les tâches 8 à 11 se marchent dessus** : elles touchent toutes
+`panel/api/`, et la 8 monte les routers des trois autres. Les faire à deux
+en parallèle produit un conflit sur `app.py` à chaque fusion. Une seule
+personne, ou alors la 8 d'abord et seule, puis 9-10-11 en parallèle sur trois
+fichiers distincts.
+
+❌ **La tâche 8 dépend de la 17.** Le `lifespan` importe
+`reconcile_stale_runs`. Faire la 17 avant la 8, ou accepter un import cassé
+pendant une demi-journée — ce que ce plan interdit explicitement.
+
+❌ **La tâche 22 (intégration réelle) ne peut pas démarrer avant la 21.** Elle
+exige la stack debout ET la VM Lima. Ce n'est pas un test unitaire, c'est une
+recette.
+
+❌ **Le worker ne se parallélise pas avec la fin du jalon 1.** Il est le
+consommateur direct de C1 et C2. Si `STEPS` bouge encore dans
+`engine/bootstrap.sh`, `panel/pipeline.py` et son test de parité bougent avec.
+
+## Points de synchronisation obligatoires
+
+1. **Début de jalon — figer C7** (Panel ↔ Infra, 30 minutes). Le contrat
+   exact, à écrire dans `docs/PANEL.md` avant la première ligne de code :
+   image `deploymatic-panel:latest`, UID/GID `10001:10001`, volume applicatif
+   `/app/runs`, engine en `/app/engine/bootstrap.sh`, secrets en
+   `/run/secrets/panel_secret_key` et `/run/secrets/worker_ssh_key`, port
+   interne `8000`, et la liste des variables `PANEL_*`. Sans ça, l'image de
+   l'Infra et le `settings.py` du Panel divergent en silence pendant une
+   semaine.
+
+2. **Avant la tâche 13 — confirmer C1 et C2** (Panel ↔ Engine). `docs/ENGINE.md`
+   lu et accepté par le Panel, et `--list-steps` déclaré stable. Le point
+   précis à trancher ensemble : **que fait le panneau des quatre étapes
+   `github_*` non implémentées ?** Ce plan répond `requires_flag` ; si l'Engine
+   prévoit de les livrer dans la semaine, la réponse peut changer.
+
+3. **Avant la tâche 19 — figer `schemas.py`** (Panel interne). Le frontend ne
+   doit pas être réécrit parce qu'un champ a changé de nom.
+
+4. **Recette (tâche 24) — à deux, Panel et Infra.** Le critère n°6
+   (`docker compose restart worker` pendant un run) se teste littéralement à
+   deux mains : l'un déclenche le déploiement et surveille le statut, l'autre
+   coupe le worker au bon moment. C'est écrit tel quel dans `TEAM-SPLIT.md` §5.
+
+5. **Fin de jalon — remonter à l'Engine** ce que l'intégration réelle a
+   révélé du contrat. Le premier consommateur trouve toujours quelque chose ;
+   ne pas le remonter, c'est le laisser trouver au jalon 3.
+
+---
+
+# Self-review (effectuée à la rédaction)
+
+## Couverture de la section « Jalon 2 » de `docs/ROADMAP.md`
+
+| Section de la feuille de route | Tâche(s) |
+|---|---|
+| Suppression de `web/` | 1 |
+| Modèle de données (`models.py`) | 3 |
+| Idempotence par la table `Step` | 5 (déclaration), 16 (application) |
+| Secrets — Fernet, `PANEL_SECRET_KEY` | 2, 12, 21 (secret Docker) |
+| Authentification — argon2, cookie, CSRF, Origin, rate limit | 6, 7, 9 |
+| API — `/login`, `/targets`, `/apps`, `/runs`, SSE, `/healthz`, `/readyz` | 8, 9, 10, 11, 18 |
+| Regex de nom d'application | 4 (validation), 12 (garde de chemin) |
+| Worker — écriture 600, subprocess, stream, parsing, retry | 12, 13, 14, 15, 16 |
+| Réconciliation au démarrage | 17 |
+| Timeouts 30 min / 10 min | 1 (réglages), 14 (étape), 16 (run) |
+| Frontend Jinja2 + JS vanilla, trois écrans | 19 |
+| Stack Docker — 4 services, healthchecks, volume, secrets, `127.0.0.1` | 20, 21 |
+| Documenter la mise derrière BunkerWeb | 23 |
+| Critères d'acceptation | 22, 24 + section « Critères d'acceptation » |
+
+Dette technique de `docs/ROADMAP.md` réglée par ce jalon : **n°3** (fuite de
+thread SSE → Task 18), **n°4** (`--workspace` non validé → Tasks 4 et 12),
+**n°6** (pas de CSRF → Task 7), **n°12** (triple duplication du nombre d'étapes
+→ Task 5, une seule constante confrontée à l'engine par un test), **n°13**
+(`PROJECT_NAME` figé → le nom d'app est le slug, D5), **n°16** (zéro test → les
+critères d'acceptation 8).
+
+## Écarts assumés par rapport à la feuille de route, à valider en revue
+
+1. **`Target.port` ajouté au modèle.** La feuille de route ne le mentionne pas,
+   mais `engine/lib/ssh_remote.sh` lit `target.port` (défaut 22) depuis la
+   tâche 11 du jalon 1, et la VM de test écoute sur `127.0.0.1:60122`. Sans ce
+   champ, la seule cible réellement disponible est injoignable depuis le
+   panneau. Vérifié dans le code, pas dans la doc.
+
+2. **`Run.rq_job_id` ajouté.** La réconciliation (D4) doit demander à Redis si
+   le job existe encore. Le modèle de la feuille de route ne porte pas cette
+   colonne, ce qui rendrait le critère d'acceptation n°6 invérifiable.
+
+3. **`Step.kind`, `attempts`, `error`, `data` ajoutés** — respectivement D1, le
+   retry sur code 1, le message de la ligne JSON, et son `data`.
+
+4. **`prepare_workspace` est une étape du pipeline, pas une préparation
+   silencieuse du worker.** La feuille de route décrit l'écriture de
+   `spec.json`/`env.json` comme le point 1 de la boucle du worker, donc invisible.
+   En faire une étape la rend visible dans l'UI, réessayable, et — surtout —
+   exerce le mécanisme des étapes Python (D1) à chaque run plutôt que dans un
+   seul test. Conséquence : `PIPELINE` n'est pas égal à `--list-steps`, il le
+   **contient**, et le test de parité vérifie l'inclusion et l'ordre relatif.
+
+5. **`requires_flag` sur les quatre étapes `github_*`.** Découvert en lisant le
+   code : `--list-steps` les liste, `engine/lib/steps.sh` ne définit aucune
+   fonction `step_github_*`. Les appeler donnerait un code 2 et casserait tout
+   run. Neutralisées par drapeau ; à revoir quand la tâche 12 du jalon 1
+   atterrit.
+
+6. **`UvicornWorker` au lieu de workers threads pour gunicorn.** La feuille de
+   route demande des threads « parce que le worker lance des subprocess ». Le
+   raisonnement ne s'applique pas ici : le processus qui lance des subprocess
+   est le **worker RQ**, qui ne tourne pas sous gunicorn du tout. Le panneau,
+   lui, sert du SSE et doit être asynchrone, sinon chaque onglet ouvert
+   immobilise un thread pour la durée d'un run. Ce qui reste vrai de la mise en
+   garde : **jamais gevent**, dont le monkey-patching casserait le `subprocess`
+   du test de connexion SSH.
+
+7. **`GET /api/csrf` n'est pas dans la liste d'endpoints de la feuille de
+   route.** Il est nécessaire : `/login` est une mutation soumise au CSRF, et un
+   visiteur non connecté n'a pas encore de token. Session anonyme, sans `uid`,
+   qui ne donne accès à rien.
+
+8. **`App.secrets_enc` séparé de `App.env`.** La feuille de route ne prévoit
+   qu'un champ `env (JSON)`. Tout chiffrer obligerait à déchiffrer la structure
+   entière pour afficher `NODE_ENV` dans l'UI ; ne rien chiffrer violerait le
+   critère n°7. La séparation tranche : `env` est lisible, `secrets_enc` est un
+   blob Fernet.
+
+9. **`env.json` est supprimé en fin de run.** La feuille de route dit que les
+   secrets « ne sortent qu'au moment d'écrire `env.json` » mais ne dit pas
+   quand ils cessent d'exister. Ce plan tranche : `cleanup_secrets` dans le
+   `finally` du runner. À rouvrir au jalon 3, où la séquence `destroy` aura
+   besoin d'un `env.json` — elle le réécrira, puisqu'un `destroy` est un run.
+
+10. **Un seul retry sur code 1, pas une politique de retry.** La feuille de
+    route dit « un retry avec backoff », au singulier. Interprété littéralement :
+    exactement un, `attempts` passe de 0 à 1, puis échec. Aucune boucle.
+
+## Ambiguïtés que je n'ai pas tranchées seul
+
+1. **Le cookie `Secure` et l'accès local.** La feuille de route exige `Secure`
+   et un port publié sur `127.0.0.1` uniquement. Les deux sont compatibles
+   grâce au traitement de `127.0.0.1` comme contexte sûr par les navigateurs —
+   mais **pas** pour un accès depuis une autre machine du LAN en HTTP. Ce plan
+   expose `PANEL_COOKIE_SECURE` (défaut `true`) et documente le cas. Si
+   l'exploitation prévoit un accès LAN direct sans TLS, c'est à décider
+   explicitement, pas à découvrir par une connexion qui échoue en silence.
+
+2. **`Run.trigger = "ci"` n'a aucun émetteur.** Le modèle de la feuille de route
+   prévoit la valeur, mais aucun endpoint du jalon 2 ne permet à une CI de
+   déclencher un run, et le jalon 3 n'en parle pas non plus. La valeur est
+   conservée dans l'enum, inutilisée. À clarifier : est-ce une intention pour
+   plus tard, ou un reliquat ?
+
+3. **Le mot « assistant d'initialisation ».** La feuille de route propose
+   `PANEL_ADMIN_PASSWORD` **ou** un assistant d'initialisation. Ce plan
+   n'implémente que la variable d'environnement, parce qu'un assistant
+   accessible sans authentification sur un panneau qui exécute du code à
+   distance est une porte d'entrée à concevoir sérieusement (jeton de premier
+   démarrage, expiration, verrouillage après usage) — trop pour une note de bas
+   de page. À arbitrer si le déploiement sans variable d'environnement est un
+   besoin réel.
+
+4. **Où vivent les journaux de run.** La feuille de route dit « un fichier de
+   log » sans dire où. Ce plan choisit `runs/<slug>/logs/run-<id>.log`, dans le
+   volume déjà partagé. Conséquence non évidente : les journaux survivent à la
+   destruction d'une application au jalon 3, dont l'étape 6 supprime
+   `runs/<slug>/`. Est-ce voulu ? Si l'audit doit survivre à la destruction, les
+   journaux doivent sortir de ce répertoire — décision du jalon 3, à ne pas
+   prendre par inadvertance ici.
