@@ -35,6 +35,24 @@ emit_fail() {
   jq -cn --arg error "${1:-erreur inconnue}" '{ok: false, error: $error}'
 }
 
+# _runtime_begin_step NOM — à appeler par le dispatcher (run_one_step, dans
+# bootstrap.sh) juste avant CHAQUE étape, aussi bien en mode --step qu'en
+# mode --all. Repositionne _CURRENT_STEP et RÉARME _RESULT_EMITTED à 0.
+#
+# Pourquoi c'est indispensable : les gardes anti-doublon (error_handler et
+# _exit_guard, plus bas) répondent à la question « une ligne de résultat a-t-
+# elle déjà été émise ? ». Sans ce réarmement, cette question est posée à
+# l'échelle du PROCESS entier, pas de l'étape courante. En mode --step ça ne
+# change rien (une seule étape par process). En mode --all, plusieurs étapes
+# tournent dans le même process : dès qu'une étape a émis une fois, la garde
+# avalerait silencieusement le résultat de TOUTE étape suivante — l'échec
+# partirait sur stderr mais disparaîtrait de stdout, alors que le contrat de
+# --all est précisément une ligne JSON PAR étape (cf. bootstrap.sh).
+_runtime_begin_step() {
+  _CURRENT_STEP="${1:-}"
+  _RESULT_EMITTED=0
+}
+
 # die MESSAGE [CODE] — échec fatal (défaut : 2, non réessayable).
 die() {
   emit_fail "${1:-erreur fatale}"

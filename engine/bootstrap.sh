@@ -136,7 +136,10 @@ run_one_step() {
   declare -F "step_${name}" >/dev/null \
     || die "étape déclarée mais non implémentée : step_${name}" 2
 
-  _CURRENT_STEP="$name"
+  # Réarme la garde anti-doublon pour CETTE étape : indispensable en mode
+  # --all où plusieurs étapes tournent dans le même process (cf. commentaire
+  # de _runtime_begin_step, lib/runtime.sh).
+  _runtime_begin_step "$name"
   ui_step "$name"
   "step_${name}"
 }
