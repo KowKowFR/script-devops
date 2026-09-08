@@ -89,11 +89,27 @@ spec_service_ids() {
 spec_get() {
   local sid="${1:?}" field="${2:?}" default="${3:-}"
   local value
+  # Utiliser has() pour distinguer un champ absent (retour défaut) d'un champ
+  # présent avec une valeur falsy (retour de la valeur). Cas spéciaux :
+  # - champ absent → retour défaut
+  # - champ = null → retour défaut (null signifie « pas de valeur »)
+  # - champ = false → retour "false" (valeur explicite)
+  # - champ = "" → retour "" (chaîne vide explicite, pas le défaut)
   value=$(jq -r --arg s "$sid" --arg f "$field" '
-    .services[] | select(.id == $s) | .[$f] // empty
-    | if type == "boolean" or type == "number" then tostring else . end
-  ' "$SPEC_JSON" 2>/dev/null || printf '')
-  if [[ -z "$value" ]]; then printf '%s' "$default"; else printf '%s' "$value"; fi
+    .services[] | select(.id == $s) |
+    if has($f) then
+      .[$f] | if . == null then "<<NULL>>"
+              elif type == "boolean" or type == "number" then tostring
+              else . end
+    else
+      "<<ABSENT>>"
+    end
+  ' "$SPEC_JSON" 2>/dev/null || printf '<<ABSENT>>')
+  if [[ "$value" == "<<ABSENT>>" ]] || [[ "$value" == "<<NULL>>" ]]; then
+    printf '%s' "$default"
+  else
+    printf '%s' "$value"
+  fi
 }
 
 spec_is_internal() {

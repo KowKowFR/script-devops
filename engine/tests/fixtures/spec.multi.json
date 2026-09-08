@@ -8,6 +8,8 @@
       "health": "/", "expose": "/" },
     { "id": "db", "image": "postgres:16-alpine", "internal": true,
       "env": { "POSTGRES_PASSWORD": "changeme" },
-      "volumes": ["pgdata:/var/lib/postgresql/data"] }
+      "volumes": ["pgdata:/var/lib/postgresql/data"] },
+    { "id": "testcase", "build": ".", "port": 9000,
+      "empty_string": "", "false_bool": false, "null_val": null, "zero_num": 0 }
   ]
 }

@@ -54,8 +54,8 @@ assert_not_contains "$(cat "$CF")" "source \"\$ENV_FILE\"" "plus de source du fi
 SPEC="$TESTS_DIR/fixtures/spec.multi.json"
 run_spec() { bash -c "source '$RT'; source '$CF'; SPEC_JSON='$SPEC'; $*" 2>/dev/null; }
 
-assert_eq "api web db" "$(run_spec 'spec_service_ids' | tr '\n' ' ' | sed 's/ $//')" \
-  "spec_service_ids liste les trois services"
+assert_eq "api web db testcase" "$(run_spec 'spec_service_ids' | tr '\n' ' ' | sed 's/ $//')" \
+  "spec_service_ids liste les quatre services"
 assert_eq "3000"  "$(run_spec 'spec_get api port')"           "spec_get lit le port conteneur"
 assert_eq "/api/" "$(run_spec 'spec_get api expose')"         "spec_get lit expose"
 assert_eq "postgres:16-alpine" "$(run_spec 'spec_get db image')" "spec_get lit image"
@@ -74,5 +74,15 @@ assert_exit_code 1 "db n'est pas exposé"  -- \
 assert_eq "api web" \
   "$(run_spec 'spec_exposed_ids_by_path_length' | tr '\n' ' ' | sed 's/ $//')" \
   "les chemins exposés sont triés du plus spécifique au plus général"
+
+# spec_get doit distinguer un champ absent d'un champ présent mais vide/false
+assert_eq "" "$(run_spec 'spec_get testcase empty_string')" \
+  "spec_get retourne chaîne vide explicite (pas le défaut)"
+assert_eq "false" "$(run_spec 'spec_get testcase false_bool')" \
+  "spec_get retourne false comme 'false' (pas le défaut)"
+assert_eq "defaut" "$(run_spec 'spec_get testcase null_val defaut')" \
+  "spec_get applique le défaut pour null"
+assert_eq "0" "$(run_spec 'spec_get testcase zero_num')" \
+  "spec_get retourne 0 comme '0' (pas le défaut)"
 
 finish
