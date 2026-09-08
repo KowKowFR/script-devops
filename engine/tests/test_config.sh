@@ -85,6 +85,40 @@ assert_eq "defaut" "$(run_spec 'spec_get testcase null_val defaut')" \
 assert_eq "0" "$(run_spec 'spec_get testcase zero_num')" \
   "spec_get retourne 0 comme '0' (pas le défaut)"
 
+# spec_init doit rejeter tout id de service hors [A-Za-z0-9_-] : c'est lui
+# qui sert de clé de mapping YAML brute dans gen_compose.sh, et à terme
+# spec.json sera généré par un LLM (jalon 5) — son contenu n'est pas fiable.
+# La validation vit dans spec_init pour protéger TOUS les consommateurs.
+BADID_SPEC=$(mktemp)
+cat > "$BADID_SPEC" <<'EOF'
+{"name":"poc","services":[{"id":"svc bad","image":"alpine"}]}
+EOF
+assert_exit_code 2 "spec_init rejette un id de service contenant un espace" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$BADID_SPEC'; spec_init"
+rm -f "$BADID_SPEC"
+
+BADID_SPEC2=$(mktemp)
+printf '{"name":"poc","services":[{"id":"svc$(id)","image":"alpine"}]}' > "$BADID_SPEC2"
+assert_exit_code 2 "spec_init rejette un id de service contenant \$(...)" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$BADID_SPEC2'; spec_init"
+rm -f "$BADID_SPEC2"
+
+BADID_SPEC3=$(mktemp)
+cat > "$BADID_SPEC3" <<'EOF'
+{"name":"poc","services":[{"id":"svc/evil","image":"alpine"}]}
+EOF
+assert_exit_code 2 "spec_init rejette un id de service contenant '/'" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$BADID_SPEC3'; spec_init"
+rm -f "$BADID_SPEC3"
+
+GOODID_SPEC=$(mktemp)
+cat > "$GOODID_SPEC" <<'EOF'
+{"name":"poc","services":[{"id":"svc-good_1","image":"alpine"}]}
+EOF
+assert_exit_code 0 "spec_init accepte un id de service lettres/chiffres/_/-'" -- \
+  bash -c "source '$RT'; source '$CF'; SPEC_JSON='$GOODID_SPEC'; spec_init"
+rm -f "$GOODID_SPEC"
+
 # spec_get doit appliquer le défaut quand le service n'existe pas (finding A)
 assert_eq "mondefaut" "$(run_spec 'spec_get service_inexistant champ mondefaut')" \
   "spec_get applique le défaut quand le service n'existe pas"

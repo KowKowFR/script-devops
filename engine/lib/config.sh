@@ -76,6 +76,23 @@ spec_init() {
   jq -e . "$SPEC_JSON" >/dev/null 2>&1 || die "spec.json n'est pas du JSON valide" 2
   jq -e '.services | type == "array" and length > 0' "$SPEC_JSON" >/dev/null 2>&1 \
     || die "spec.json doit contenir un tableau 'services' non vide" 2
+
+  # Défense en profondeur contre l'injection YAML (cf. gen_compose.sh) : l'id
+  # de service atterrit tel quel comme clé de mapping YAML (`printf '  %s:\n'
+  # "$sid"`). Le placer ici, dans spec_init, protège TOUS les consommateurs de
+  # spec.json — pas seulement gen_compose — dès aujourd'hui et pour les
+  # consommateurs futurs (jalon 5 : spec.json généré par un LLM).
+  local bad_ids
+  bad_ids=$(jq -r '
+    [ .services[].id
+      | (if type == "string" then . else tojson end) as $s
+      | select(($s | test("^[A-Za-z0-9_-]+$")) | not)
+      | $s
+    ] | join(", ")
+  ' "$SPEC_JSON" 2>/dev/null)
+  [[ -z "$bad_ids" ]] \
+    || die "id(s) de service invalide(s) dans spec.json (lettres, chiffres, '_' et '-' uniquement) : ${bad_ids}" 2
+
   local dupes
   dupes=$(jq -r '[.services[].id] | group_by(.) | map(select(length > 1) | .[0]) | join(",")' "$SPEC_JSON")
   [[ -z "$dupes" ]] || die "ids de service dupliqués dans spec.json : ${dupes}" 2
