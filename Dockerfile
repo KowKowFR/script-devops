@@ -60,9 +60,16 @@ https://download.docker.com/linux/debian $(. /etc/os-release && echo $VERSION_CO
 RUN groupadd -g 10001 panel && useradd -u 10001 -g 10001 -m -s /bin/bash panel
 
 WORKDIR /app
+
+# Couche de dépendances séparée du code : pyproject.toml déclare son propre
+# backend ([build-system] -> setuptools), pip le récupère lui-même dans un
+# environnement de build isolé (PEP 517) — rien à forcer ici. Cette couche
+# ne change que si pyproject.toml change, donc ne se reconstruit pas à
+# chaque modification de panel/. Le paquet "deploymatic-panel" installé ici
+# est vide de code (panel/ n'existe pas encore dans le contexte de cette
+# couche, seul pyproject.toml y est copié) : seules les dépendances comptent.
 COPY pyproject.toml /app/
-RUN pip install --no-cache-dir /app 2>/dev/null || \
-    (pip install --no-cache-dir hatchling && pip install --no-cache-dir /app)
+RUN pip install --no-cache-dir .
 
 COPY --chown=panel:panel panel/ /app/panel/
 COPY --chown=panel:panel engine/ /app/engine/
@@ -82,6 +89,13 @@ EXPOSE 8000
 
 # Commande par défaut : le panneau (FastAPI/gunicorn). Le worker (rq worker)
 # surcharge cette commande dans compose.yml — même image, deux commandes.
+#
+# panel/ est copié en source sous /app, jamais réinstallé comme paquet après
+# le pip install de la couche précédente (qui ne voit encore que
+# pyproject.toml). Ça fonctionne sans PYTHONPATH supplémentaire : gunicorn
+# insère lui-même son --chdir (par défaut le cwd, ici /app via WORKDIR) en
+# tête de sys.path (gunicorn/app/base.py, Application.chdir) — vérifié
+# localement par `gunicorn --check-config` depuis un répertoire équivalent.
 CMD ["gunicorn", "panel.api.app:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "2", "--bind", "0.0.0.0:8000", \
