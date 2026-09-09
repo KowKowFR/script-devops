@@ -609,7 +609,17 @@ _require_docker_host() {
 # court-circuiter cette détection (fichier de workflow absent ou déplacé).
 _require_app_name() {
   if [[ -z "${APP_NAME:-}" ]]; then
-    APP_NAME="$(grep -m1 '^  APP_NAME:' "$WORKFLOW_FILE" 2>/dev/null | awk '{print $2}')"
+    # "|| true" sur le PIPELINE ENTIER (pas seulement grep) : sous
+    # set -o pipefail, un grep qui ne trouve rien (fichier absent, ou
+    # simplement "APP_NAME:" renommé/reformaté) rend un statut non nul pour
+    # tout le pipeline, MEME SI awk a réussi sur une entrée vide (pipefail
+    # retient le pire code, pas celui de la dernière commande). Sans ce
+    # garde, `set -e` arrête le script sur-le-champ à cette affectation,
+    # AVANT que le message d'aide du ":?" juste en dessous ne soit jamais
+    # atteint - échec silencieux, zéro sortie, exactement le scénario
+    # "le format du workflow change" que cette détection est censée rendre
+    # diagnosticable.
+    APP_NAME="$(grep -m1 '^  APP_NAME:' "$WORKFLOW_FILE" 2>/dev/null | awk '{print $2}' || true)"
   fi
   : "${APP_NAME:?APP_NAME required (could not auto-detect it from ${WORKFLOW_FILE} - export it explicitly, same value used to generate this project)}"
 }
@@ -627,7 +637,10 @@ case "${1:?usage: rollback.sh list|to <target>}" in
   list)
     _require_docker_host
     _require_app_name
-    running="$(_running_tag)"
+    # "|| true" : même raisonnement que _require_app_name plus haut - si le
+    # démon distant est injoignable, on veut un "<none found>" lisible, pas
+    # un arrêt muet de tout le script sous set -e/pipefail.
+    running="$(_running_tag || true)"
     echo "Currently running on target (project ${APP_NAME}): ${running:-<none found>}"
     echo "deploy/.env in this clone (may be stale - this clone may not be the one that deployed it): $(current_tag 2>/dev/null || echo '<none>')"
     echo "For anything older than what is running: git log --oneline (a deployed tag IS a commit SHA)."
