@@ -1,9 +1,15 @@
 # Jalon 1 — état de vérification
 
-Vérification exécutée le 9 septembre 2026, sur le dépôt à
-`a2688b9` + les corrections de la tâche 12 (`a61a681`). Chaque critère a été
-rejoué réellement pour ce document — aucune ligne ci-dessous ne reprend une
+Vérification exécutée le 9 septembre 2026. Chaque critère a été rejoué
+réellement pour ce document — aucune ligne ci-dessous ne reprend une
 affirmation d'un plan sans l'avoir fait tourner.
+
+> **Mise à jour, `54020f1`.** Le point de friction du critère 6 — l'impossibilité
+> pour `DOCKER_HOST=ssh://` de porter une identité SSH — **a été corrigé depuis
+> la rédaction initiale de ce document**. `docker_remote` pose désormais un
+> wrapper `ssh` temporaire qui injecte `-i` (mode clé) ou route par `sshpass`
+> (mode mot de passe). Le contournement par `~/.ssh/config` n'est plus
+> nécessaire. Voir la section 6 pour la vérification refaite.
 
 | # | Critère | État |
 |---|---|---|
@@ -12,10 +18,10 @@ affirmation d'un plan sans l'avoir fait tourner.
 | 3 | Plus de mentions Kubernetes involontaires sous `engine/` | ✅ vérifié |
 | 4 | Plus aucun `source` de fichier de configuration | ✅ vérifié |
 | 5 | Chaque `--step` renvoie exactement une ligne JSON | ✅ vérifié |
-| 6 | `--all` déploie l'app de démo de bout en bout sur une cible SSH | 🟡 **vérifié pas à pas, un point de friction documenté** |
+| 6 | `--all` déploie l'app de démo de bout en bout sur une cible SSH | 🟡 **pipeline réel réussi ; bloc GitHub non exercé** |
 | 7 | Le compose généré passe `docker compose config --quiet` | ✅ vérifié |
 
-Suite de tests complète : `bash engine/tests/run.sh` → **242 assertions,
+Suite de tests complète : `bash engine/tests/run.sh` → **255 assertions,
 TOUT PASSE** (`bash -n` + `shellcheck --severity=error` inclus dans le même
 run).
 
@@ -285,3 +291,48 @@ distant. Signalé, non corrigé ici.
 - [`TEST-TARGET.md`](TEST-TARGET.md) — la cible SSH de test utilisée ici.
 - [`CURRENT-STATE.md`](CURRENT-STATE.md) — état factuel du jalon 1 (à mettre
   à jour séparément).
+
+
+---
+
+## Addendum — la friction du critère 6 est levée
+
+Au moment de la rédaction initiale, `build_images` échouait en
+`Permission denied (publickey)` et n'avait pu aboutir qu'en ajoutant un alias
+dans le `~/.ssh/config` **personnel de l'utilisateur**. C'était un contournement,
+pas une solution : il ne fonctionne ni en CI, ni dans le conteneur worker du
+jalon 2, qui aura sa clé montée par un secret Docker et aucun `~/.ssh/config`.
+
+**Cause mesurée, pas supposée.** En plaçant un faux `ssh` journalisant devant
+Docker, on observe que `DOCKER_HOST=ssh://…:60122` invoque :
+
+```
+ssh -l devops -p 60122 -o ConnectTimeout=30 -T -- <host> "docker system dial-stdio"
+```
+
+Docker transmet bien le port, mais **ne fournit jamais d'identité** et n'offre
+aucune option pour en passer une.
+
+**Correction.** `docker_remote` construit désormais, dans un répertoire
+temporaire propre à l'appel, un wrapper `ssh` placé en tête de `PATH` qui injecte
+`-i` en mode clé, ou délègue à `sshpass -e` en mode mot de passe — le même
+mécanisme que celui déjà validé dans le workflow CI généré. Le vrai `ssh` est
+résolu par `command -v` **avant** toute modification du `PATH`, pour éviter la
+récursion.
+
+**Vérification refaite, sans alias.** `runs/testvm/env.json` vise directement
+`127.0.0.1:60122` avec un chemin de clé explicite :
+
+```
+--step deploy_stack          {"ok":true,...}
+--step validate_deployment   {"ok":true,"data":{"services_ok":2}}
+```
+
+Le `~/.ssh/config` a été déplacé puis restauré à l'identique, et les étapes
+rejouées sans lui : elles passent. Aucun répertoire temporaire ne subsiste.
+
+**Ce qui reste non exercé** : le mode mot de passe est couvert par des tests
+unitaires mais pas par un appel réel de bout en bout — la VM de test n'accepte
+que l'authentification par clé. Et le bloc GitHub n'a été vérifié que sur son
+chemin désactivé, faute de compte de test. C'est ce qui maintient le critère 6
+en 🟡 plutôt qu'en ✅.
