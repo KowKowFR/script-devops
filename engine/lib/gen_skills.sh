@@ -311,7 +311,8 @@ deploy, so the running stack is always pinned to an immutable tag — never to
 `latest`. Rolling back means putting an older SHA back in that line and
 running `docker compose up -d` against the target's daemon (`DOCKER_HOST=
 ssh://…`, see "Target access" above) — see the `rollback-manager` skill,
-which does exactly this from `deploy/.image-history`.
+which does exactly this, resolving the target SHA from the target's Docker
+daemon and git history (never a local file — see that skill for why).
 EOF
 
 # ====================================================================
@@ -456,7 +457,7 @@ mkdir -p "$SKILLS_DIR/rollback-manager/scripts"
 cat > "$SKILLS_DIR/rollback-manager/SKILL.md" <<'EOF'
 ---
 name: rollback-manager
-description: Use this skill when the user wants to MANUALLY roll back a deployment to a previous version, either by selecting a specific image SHA from deploy/.image-history, or simply "the previous version". Triggers include "rollback to <sha>", "revert last deploy", "go back to commit abc1234", "annule le dernier déploiement", "reviens à la version d'hier". Different from health-monitor (which rolls back automatically on health failure) — this skill is for INTENTIONAL human-driven rollbacks.
+description: Use this skill when the user wants to MANUALLY roll back a deployment to a previous version, either by a specific commit SHA (see `git log`) or simply "the previous version" (the commit deployed just before whatever is currently running on the target). Triggers include "rollback to <sha>", "revert last deploy", "go back to commit abc1234", "annule le dernier déploiement", "reviens à la version d'hier". Different from health-monitor (which rolls back automatically on health failure) — this skill is for INTENTIONAL human-driven rollbacks.
 ---
 
 # rollback-manager
@@ -469,44 +470,63 @@ Roll back the deployment to a chosen previous image tag (commit SHA).
 - **health-monitor**: rolls back AUTOMATICALLY when a health check fails after a deploy.
 - **docker-deploy**: deploys a NEW version (forward).
 
-## Why Compose has no built-in undo command
+## Where the tag history actually lives
 
-Docker Compose keeps no revision history by itself. The only source of truth
-is `deploy/.image-history`, a file listing the last five deployed SHAs (most
-recent first), written by `scripts/record_tag.sh` after every successful
-deploy. Without it, "go back to the previous version" is meaningless — there
-would be nothing to go back to.
+Docker Compose keeps no revision history by itself. This project used to
+keep its own local file for that — written after every successful deploy —
+and it never actually worked, so it has been removed: the CI runner's git
+clone is thrown away after every run, and a developer's own clone never
+deploys by itself (deploys always go through the CI, see the `docker-deploy`
+skill). Nothing was ever in a position to write to such a file AND still be
+around later, on the SAME clone, to read it back — so "the previous
+version" could never reliably be answered from it. Don't look for a local
+history file; there isn't one, on purpose.
 
-**`deploy/.image-history` is LOCAL to this git clone** — it lives in the
-working tree, is gitignored like `deploy/.env`, and is never synced to the
-CI runner or to another developer's machine. Rolling back from a machine
-that never ran a successful `docker-deploy` on it will find it empty or
-stale; when that happens, pick the target SHA from `git log` instead, or
-run `scripts/rollback.sh to <sha>` directly — it does not require the
-history file, only `to previous` does.
+The information lives in two REAL places instead — target state and git,
+never a local file:
+
+- **What is currently running** — the target's own Docker daemon knows it.
+  `scripts/rollback.sh list` asks it directly (`docker ps --filter
+  label=com.docker.compose.project=…`), the exact same query as the CI's own
+  "Tag actuellement déployé" step in `.github/workflows/deploy.yml`.
+- **What came before that** — git knows it. A deployed tag IS a commit SHA
+  (see `docker-deploy`'s tagging strategy), so "the previous version" is
+  `git rev-parse "$CURRENT^"` — the parent, in git history, of the commit
+  currently running on the target. `scripts/rollback.sh to previous`
+  resolves it this way automatically. For anything further back, `git log`
+  IS the record: unlike a local file, it is identical on every clone.
 
 ## Target access (DOCKER_HOST)
 
 `scripts/rollback.sh` runs `docker compose pull && docker compose up -d`
-against the **target's** Docker daemon, never the machine it runs on. It
-requires `TARGET_HOST` and `TARGET_USER` (same values as the GitHub secrets
-of the same name) exported before it runs:
+(and reads current state via `docker ps`) against the **target's** Docker
+daemon, never the machine it runs on. It requires `TARGET_HOST` and
+`TARGET_USER` (same values as the GitHub secrets of the same name) exported
+before it runs:
 
 ```
 export TARGET_HOST=<same value as the GitHub secret TARGET_HOST>
 export TARGET_USER=<same value as the GitHub secret TARGET_USER>
 ```
 
-The script builds `DOCKER_HOST=ssh://$TARGET_USER@$TARGET_HOST` itself and
-fails fast (before touching `deploy/.env`) if either is missing — it never
+The script builds `DOCKER_HOST=ssh://$TARGET_USER@$TARGET_HOST` itself (add
+`export TARGET_PORT=<same value as the GitHub secret TARGET_PORT>` too, only
+if the target uses a non-standard SSH port) and fails fast (before touching
+`deploy/.env`) if `TARGET_HOST`/`TARGET_USER` are missing — it never
 silently falls back to a local Docker daemon.
+
+`APP_NAME` (the compose project name on the target) is auto-detected from
+`.github/workflows/deploy.yml`'s own `APP_NAME:` job env line — the exact
+same value the CI itself uses, so there is nothing to remember or keep in
+sync by hand. Export `APP_NAME` explicitly only to override this (e.g. that
+file was moved or renamed).
 
 ## Workflow
 
-1. Run `scripts/rollback.sh list` to display the current tag and the history.
+1. Run `scripts/rollback.sh list` to see what is currently running on the target.
 2. Help the user pick a target:
-   - by SHA (from the history, or from `git log`),
-   - by "previous" (the second line of `.image-history`, simplest case).
+   - by SHA (from `git log`, or from whatever `list` just showed),
+   - by "previous" — resolved automatically from the current tag's parent commit.
 3. With `TARGET_HOST`/`TARGET_USER` exported (see "Target access" above),
    run `scripts/rollback.sh to <target>` (or `scripts/rollback.sh to previous`).
 4. Wait for `docker compose up -d` to report the containers as started.
@@ -525,42 +545,54 @@ Suggested next: health-monitor (verify the rolled-back version is healthy)
 
 ## Rules
 
-- Never edit `deploy/.image-history` by hand — it is only ever written by
-  `scripts/record_tag.sh`.
+- Never guess a rollback target from memory — always resolve it from
+  `scripts/rollback.sh list` (target state) or `git log` (history). There is
+  no local history file to fall back on, on purpose (see above).
 - Always confirm the target with the user if `<target>` is ambiguous.
 - Rolling back does not remove the bad SHA from git history — the underlying
   bug still needs a forward fix.
 - Display the diff (`git log <from>..<to>`) if both SHAs are available, so the
   user knows what's being reverted.
-- `deploy/.image-history` is local to this clone, not shared state — don't
-  treat an empty or short history as "no previous deploys ever happened".
 EOF
 
 cat > "$SKILLS_DIR/rollback-manager/scripts/rollback.sh" <<'EOF'
 #!/usr/bin/env bash
-# Rollback helper — puts a previous image tag back into deploy/.env.
+# Rollback helper — points deploy/.env at a different image tag and applies
+# it on the target. State comes from TWO real places, never a local file:
+#   - the target's own Docker daemon (DOCKER_HOST=ssh://…) for what is
+#     CURRENTLY running — same `docker ps` filter as the "Tag actuellement
+#     déployé" step of .github/workflows/deploy.yml.
+#   - git history for anything before that: a deployed tag IS a commit SHA,
+#     so "the version before the current one" is `git rev-parse "$CURRENT^"`.
+# This project used to keep a local per-clone history file for this. It
+# never worked: the CI runner's clone is discarded after every run, and a
+# developer clone never deploys by itself (see docker-deploy) — nothing was
+# ever in a position to write to it AND still be around later, on the SAME
+# clone, to read it back. Removed for good; see rollback-manager's SKILL.md
+# for the full reasoning.
 #
 # Usage:
-#   rollback.sh list           show the history of deployed tags
-#   rollback.sh to previous    roll back to the previous tag
-#   rollback.sh to <sha>       roll back to a specific SHA
+#   rollback.sh list           show what is currently running on the target
+#   rollback.sh to previous    roll back to the commit before the current one
+#   rollback.sh to <sha>       roll back to a specific SHA (see `git log`)
 
 set -euo pipefail
 
 DEPLOY_DIR="${DEPLOY_DIR:-deploy}"
 ENV_FILE="${DEPLOY_DIR}/.env"
-HISTORY="${DEPLOY_DIR}/.image-history"
+WORKFLOW_FILE="${WORKFLOW_FILE:-.github/workflows/deploy.yml}"
 
 current_tag() { grep '^IMAGE_TAG=' "$ENV_FILE" | cut -d= -f2; }
 
 # _require_docker_host — construit et exporte DOCKER_HOST=ssh://user@host
 # (port optionnel via TARGET_PORT) depuis TARGET_USER/TARGET_HOST (mêmes
 # valeurs que les secrets GitHub du même nom). Sans ça, le `docker compose
-# pull`/`up -d` plus bas parlerait au démon Docker LOCAL de la machine qui
-# exécute ce script — jamais celui de la cible : ce script tournerait alors
-# en silence contre le mauvais démon, potentiellement en démarrant des
-# conteneurs sur le poste du développeur. Appelée avant toute écriture dans
-# deploy/.env : en cas de variable manquante, rien n'est modifié sur disque.
+# pull`/`up -d` (et la lecture de _running_tag) plus bas parlerait au démon
+# Docker LOCAL de la machine qui exécute ce script — jamais celui de la
+# cible : ce script tournerait alors en silence contre le mauvais démon,
+# potentiellement en démarrant des conteneurs sur le poste du développeur.
+# Appelée avant toute écriture dans deploy/.env : en cas de variable
+# manquante, rien n'est modifié sur disque.
 _require_docker_host() {
   : "${TARGET_HOST:?TARGET_HOST required (same value as the GitHub secret TARGET_HOST) - this script drives the Docker daemon on the target, never the local one}"
   : "${TARGET_USER:?TARGET_USER required (same value as the GitHub secret TARGET_USER)}"
@@ -568,25 +600,55 @@ _require_docker_host() {
   export DOCKER_HOST
 }
 
+# _require_app_name — APP_NAME identifie le projet compose sur la cible
+# (docker compose --project-name "$APP_NAME", et le label que docker ps
+# filtre plus bas). Auto-détecté depuis la propre ligne "APP_NAME: <valeur>"
+# de l'env du job dans .github/workflows/deploy.yml — la même valeur que le
+# CI utilise — plutôt que de demander à l'appelant de s'en souvenir ou de la
+# garder synchronisée à la main. Positionner APP_NAME explicitement pour
+# court-circuiter cette détection (fichier de workflow absent ou déplacé).
+_require_app_name() {
+  if [[ -z "${APP_NAME:-}" ]]; then
+    APP_NAME="$(grep -m1 '^  APP_NAME:' "$WORKFLOW_FILE" 2>/dev/null | awk '{print $2}')"
+  fi
+  : "${APP_NAME:?APP_NAME required (could not auto-detect it from ${WORKFLOW_FILE} - export it explicitly, same value used to generate this project)}"
+}
+
+# _running_tag — tag d'image actuellement en cours d'exécution sur la cible
+# pour CE projet compose, lu depuis le démon Docker de la cible
+# (DOCKER_HOST doit déjà être exporté). Même filtre que l'étape "Tag
+# actuellement déployé" du CI (.github/workflows/deploy.yml).
+_running_tag() {
+  docker ps --filter "label=com.docker.compose.project=${APP_NAME}" \
+    --format '{{.Image}}' | head -1 | awk -F: '{print $NF}'
+}
+
 case "${1:?usage: rollback.sh list|to <target>}" in
   list)
-    echo "Current tag: $(current_tag)"
-    echo "History (most recent first):"
-    [[ -f "$HISTORY" ]] && cat "$HISTORY" || echo "  (empty)"
+    _require_docker_host
+    _require_app_name
+    running="$(_running_tag)"
+    echo "Currently running on target (project ${APP_NAME}): ${running:-<none found>}"
+    echo "deploy/.env in this clone (may be stale - this clone may not be the one that deployed it): $(current_tag 2>/dev/null || echo '<none>')"
+    echo "For anything older than what is running: git log --oneline (a deployed tag IS a commit SHA)."
     ;;
 
   to)
     _require_docker_host
+    _require_app_name
     target="${2:?usage: rollback.sh to previous|<sha>}"
     if [[ "$target" == "previous" ]]; then
-      [[ -f "$HISTORY" ]] || { echo "no history available" >&2; exit 1; }
-      target=$(sed -n '2p' "$HISTORY")
-      [[ -n "$target" ]] || { echo "no previous tag available" >&2; exit 1; }
+      current="$(_running_tag)"
+      [[ -n "$current" ]] \
+        || { echo "no container currently running for project ${APP_NAME} on the target - nothing to compute 'previous' from, pass an explicit SHA" >&2; exit 1; }
+      target="$(git rev-parse "${current}^" 2>/dev/null)" \
+        || { echo "cannot resolve the commit before ${current} (shallow clone, detached tag, or ${current} is not in this repo's history) - pass an explicit SHA instead" >&2; exit 1; }
     fi
-    echo "Rollback: $(current_tag) -> ${target} (DOCKER_HOST=${DOCKER_HOST})"
+    echo "Rollback: $(_running_tag || echo '<unknown>') -> ${target} (DOCKER_HOST=${DOCKER_HOST})"
     sed -i.bak "s/^IMAGE_TAG=.*/IMAGE_TAG=${target}/" "$ENV_FILE"
     rm -f "${ENV_FILE}.bak"
-    (cd "$DEPLOY_DIR" && docker compose pull && docker compose up -d --remove-orphans)
+    (cd "$DEPLOY_DIR" && docker compose --project-name "$APP_NAME" pull \
+      && docker compose --project-name "$APP_NAME" up -d --remove-orphans)
     echo "current_tag=$(current_tag)"
     ;;
 
@@ -598,39 +660,6 @@ esac
 EOF
 chmod +x "$SKILLS_DIR/rollback-manager/scripts/rollback.sh"
 
-cat > "$SKILLS_DIR/rollback-manager/scripts/record_tag.sh" <<'EOF'
-#!/usr/bin/env bash
-# Records the currently deployed image tag at the top of
-# deploy/.image-history, keeping only the 5 most recent entries. Run right
-# after a successful deploy — this is what makes "rollback to previous"
-# possible.
-#
-# Usage: record_tag.sh [DEPLOY_DIR]
-
-set -euo pipefail
-
-DEPLOY_DIR="${1:-deploy}"
-ENV_FILE="${DEPLOY_DIR}/.env"
-HISTORY="${DEPLOY_DIR}/.image-history"
-
-[[ -f "$ENV_FILE" ]] || { echo "${ENV_FILE} not found" >&2; exit 1; }
-
-tag=$(grep '^IMAGE_TAG=' "$ENV_FILE" | cut -d= -f2)
-[[ -n "$tag" ]] || { echo "IMAGE_TAG not set in ${ENV_FILE}" >&2; exit 1; }
-
-tmp="$(mktemp "${HISTORY}.XXXXXX")"
-{
-  printf '%s\n' "$tag"
-  if [[ -f "$HISTORY" ]]; then
-    grep -vFx "$tag" "$HISTORY" || true
-  fi
-} | head -n 5 > "$tmp"
-mv -f "$tmp" "$HISTORY"
-
-echo "recorded=$tag"
-EOF
-chmod +x "$SKILLS_DIR/rollback-manager/scripts/record_tag.sh"
-
 # ====================================================================
 # Summary
 # ====================================================================
@@ -638,5 +667,5 @@ echo "  • .agents/skills/microservice-editor/"
 echo "  • .agents/skills/github-flow/"
 echo "  • .agents/skills/docker-deploy/ (+ 2 scripts + DEPLOYMENT_GUIDE.md)"
 echo "  • .agents/skills/health-monitor/ (+ check_health.sh)"
-echo "  • .agents/skills/rollback-manager/ (+ rollback.sh + record_tag.sh)"
+echo "  • .agents/skills/rollback-manager/ (+ rollback.sh)"
 echo "  • .claude/skills → symlink vers .agents/skills"
