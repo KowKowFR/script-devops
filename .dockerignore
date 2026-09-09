@@ -1,0 +1,51 @@
+# Contexte de build de l'image commune panel/worker (tâche 20).
+#
+# Rien de ce qui suit ne doit entrer dans le contexte envoyé au démon
+# Docker : ni l'historique git, ni un environnement virtuel, ni un cache
+# Python, ni un run déjà exécuté, ni la cible SSH de test, ni un secret.
+# Un secret qui entrerait dans une couche intermédiaire y resterait même
+# après un `rm` dans une étape suivante — d'où l'exclusion à la source.
+
+# Historique et métadonnées git — jamais utile à l'image, potentiellement
+# volumineux, et peut contenir des éléments sensibles dans l'historique.
+.git
+.gitignore
+
+# Environnements virtuels et caches Python — reconstruits dans l'image par
+# pip install ; les embarquer gonflerait l'image et pourrait y faire entrer
+# des artefacts compilés pour une plateforme différente.
+.venv
+venv
+**/__pycache__
+*.pyc
+.pytest_cache
+
+# Volume applicatif à l'exécution (secrets par run, spec.json, logs) —
+# jamais un artefact de build, toujours gitignoré, jamais dans une image.
+runs
+
+# Secrets Docker locaux (clé Fernet, clé SSH du worker) : montés en secrets
+# Docker au lancement (tâche 21), jamais copiés dans l'image ni dans une
+# couche intermédiaire.
+secrets
+
+# Cible SSH de test (engine/tools/test-target.sh) : clé privée dédiée,
+# config Lima générée, alias SSH — jamais dans une image.
+.test-target
+
+# Documentation et tests ne font pas partie de l'image servie. (web/,
+# l'ancien panneau Flask, a été supprimé du dépôt à la tâche 1 : plus
+# besoin de l'exclure ici, il n'existe plus.)
+docs
+tests
+
+# Variables d'environnement locales, jamais commitées, jamais construites
+# dans une image.
+.env
+*.env
+!.env.example
+
+# Éditeurs et OS.
+.vscode
+.idea
+.DS_Store
