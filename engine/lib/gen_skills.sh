@@ -145,10 +145,31 @@ Building Docker images locally caused platform mismatch issues (Mac ARM64 vs the
 2. Update `services/api/server.js` line `APP_VERSION`.
 3. Stage and commit the change with message `chore(release): vX.Y.Z`.
 4. Push to origin/main → this triggers the GitHub Actions workflow, which
-   builds the image, pushes it tagged with the commit SHA, then rewrites
-   `IMAGE_TAG` in `deploy/.env` on the target and runs `docker compose up -d`.
+   builds the image and pushes it tagged with the commit SHA, then rewrites
+   `IMAGE_TAG` in a FRESH `deploy/.env` on the runner itself (nothing is
+   copied to the target) and drives `docker compose pull && up -d` against
+   the target's Docker daemon via `DOCKER_HOST=ssh://…` — see "Target
+   access" below if you ever need to reproduce that manually.
 5. Watch the workflow with `gh run watch` (or print the URL for the user).
 6. Once the workflow completes successfully, invoke the `health-monitor` skill.
+
+## Target access (DOCKER_HOST)
+
+The CI never runs `docker`/`docker compose` on the local runner's own
+daemon, and neither should you if you ever need to check state on the
+target directly instead of waiting on CI logs. Export, first:
+
+```
+export TARGET_HOST=<same value as the GitHub secret TARGET_HOST>
+export TARGET_USER=<same value as the GitHub secret TARGET_USER>
+export DOCKER_HOST="ssh://${TARGET_USER}@${TARGET_HOST}"
+```
+
+Then `docker compose -f deploy/compose.yml ps` (for example) reaches the
+TARGET's containers. Without `DOCKER_HOST` set, that same command silently
+talks to YOUR OWN local Docker daemon instead — on a laptop, that can mean
+pulling images to your machine or starting containers there, not on the
+target, with no error to warn you.
 
 ## Output format
 
@@ -243,7 +264,16 @@ cat > "$SKILLS_DIR/docker-deploy/references/DEPLOYMENT_GUIDE.md" <<'EOF'
 
 1. **Local edit** (microservice-editor skill): code is modified on the developer's machine.
 2. **Git push** (github-flow skill): change is committed and pushed to GitHub.
-3. **CI/CD** (this skill): GitHub Actions builds the image, pushes to Docker Hub, then SSH into the target server to rewrite `IMAGE_TAG` in `deploy/.env` and run `docker compose up -d`.
+3. **CI/CD** (this skill): GitHub Actions builds the image, pushes it to Docker
+   Hub, rewrites `IMAGE_TAG` in a fresh `deploy/.env` **on the runner itself**
+   (checked out from the same commit — nothing is ever copied to the target),
+   then drives `docker compose pull && up -d` against the target's Docker
+   daemon via `DOCKER_HOST=ssh://$TARGET_USER@$TARGET_HOST`. The runner never
+   SSHes in to run commands on the target for this part — only the
+   post-deploy application health-check does that (see below), because a
+   `curl` on `127.0.0.1` only makes sense executed from the target's own
+   network namespace, and Docker's `ssh://` transport tunnels its own API
+   protocol only, not arbitrary shell commands.
 
 ## Workflow file
 
@@ -252,8 +282,10 @@ The CI/CD workflow lives at `.github/workflows/deploy.yml`. It has 4 jobs:
 - `detect-changes` — uses `dorny/paths-filter` to identify which microservices changed
 - `build-and-push-api` — builds and pushes the API image (only if `api` changed)
 - `build-and-push-web` — builds and pushes the web image (only if `web` changed)
-- `deploy` — SSH into the target, rewrites `IMAGE_TAG` in `deploy/.env` with the
-  SHA tag, then runs `docker compose pull && docker compose up -d --remove-orphans`
+- `deploy` — rewrites `IMAGE_TAG` in `deploy/.env` with the SHA tag, then runs
+  `docker compose pull && docker compose up -d --remove-orphans` against the
+  target's Docker daemon via `DOCKER_HOST=ssh://…` (see above — no file is
+  ever written on the target itself)
 
 ## Secrets
 
@@ -276,8 +308,10 @@ Each image is pushed with TWO tags:
 `deploy/compose.yml` references `${IMAGE_TAG}`, interpolated by Compose from
 `deploy/.env`. The CI rewrites that single line with the commit SHA on every
 deploy, so the running stack is always pinned to an immutable tag — never to
-`latest`. Rolling back means putting an older SHA back in that line and running
-`docker compose up -d`.
+`latest`. Rolling back means putting an older SHA back in that line and
+running `docker compose up -d` against the target's daemon (`DOCKER_HOST=
+ssh://…`, see "Target access" above) — see the `rollback-manager` skill,
+which does exactly this from `deploy/.image-history`.
 EOF
 
 # ====================================================================
@@ -297,25 +331,46 @@ Verify the production deployment and rollback automatically if any check fails.
 
 ## Checks performed (in order)
 
-1. **Container status** — `docker compose ps` : every service is `running`, and
-   every service that declares a healthcheck is `healthy`.
+1. **Container status** — `docker compose ps` against the target's Docker
+   daemon (`DOCKER_HOST=ssh://…`, see "Target access" below) : every service
+   is `running`, and every service that declares a healthcheck is `healthy`.
 2. **Restart count** — no container has restarted in the last 5 minutes
-   (`docker inspect -f '{{.RestartCount}}'`).
+   (`docker inspect -f '{{.RestartCount}}'`, same `DOCKER_HOST`).
 3. **HTTP health-check** — each exposed service answers on
-   `http://127.0.0.1:<host port><health path>`, **from the target host**. Never
-   from a public URL: the target is not publicly reachable, only BunkerWeb is.
+   `http://127.0.0.1:<host port><health path>`, run **from the target host
+   itself via `ssh` directly** (not via `DOCKER_HOST` — Docker's `ssh://`
+   transport tunnels its own API protocol only, never arbitrary shell
+   commands like `curl`). Never from a public URL: the target is not
+   publicly reachable, only BunkerWeb is.
 4. **Response time** — under 1 second.
+
+## Target access (DOCKER_HOST)
+
+Checks 1 and 2 above run `docker`/`docker compose` — always against the
+target, never against whatever Docker daemon happens to be local to the
+machine this skill runs on. Before running them, export:
+
+```
+export TARGET_HOST=<same value as the GitHub secret TARGET_HOST>
+export TARGET_USER=<same value as the GitHub secret TARGET_USER>
+export DOCKER_HOST="ssh://${TARGET_USER}@${TARGET_HOST}"
+```
+
+A bare `docker compose ps` without `DOCKER_HOST` set would report on
+containers on the WRONG machine (or none at all) — a false "healthy" or a
+false "unreachable", either way not the target's actual state.
 
 ## Workflow
 
-1. Run `docker compose ps` (via SSH on the target) to check container status
-   and restart counts.
-2. Use `scripts/check_health.sh <host port> <health path>` on the target host
-   to verify the HTTP endpoint.
+1. With `DOCKER_HOST` exported as above, run `docker compose ps` and
+   `docker inspect` to check container status and restart counts.
+2. Use `scripts/check_health.sh <host port> <health path>`, executed via a
+   direct `ssh` to the target (not through `DOCKER_HOST`), to verify the
+   HTTP endpoint.
 3. If ALL checks pass: report success and the current version.
 4. If ANY check fails:
    - Invoke the `rollback-manager` skill to put the previous SHA back in
-     `deploy/.env` and re-run `docker compose up -d`.
+     `deploy/.env` and re-run `docker compose up -d` (same `DOCKER_HOST`).
    - Re-run the health-check.
    - Report what was rolled back and why.
 
@@ -354,6 +409,9 @@ Rolling back deploy/.env to the previous SHA…
 - Maximum 3 retries on the HTTP health-check before declaring failure.
 - Never modify code or `deploy/.env` directly — only trigger the
   `rollback-manager` skill.
+- Never run `docker`/`docker compose` without `DOCKER_HOST` set to the
+  target — see "Target access" above. It talks to your own local daemon
+  otherwise, silently.
 EOF
 
 cat > "$SKILLS_DIR/health-monitor/scripts/check_health.sh" <<'EOF'
@@ -419,13 +477,38 @@ recent first), written by `scripts/record_tag.sh` after every successful
 deploy. Without it, "go back to the previous version" is meaningless — there
 would be nothing to go back to.
 
+**`deploy/.image-history` is LOCAL to this git clone** — it lives in the
+working tree, is gitignored like `deploy/.env`, and is never synced to the
+CI runner or to another developer's machine. Rolling back from a machine
+that never ran a successful `docker-deploy` on it will find it empty or
+stale; when that happens, pick the target SHA from `git log` instead, or
+run `scripts/rollback.sh to <sha>` directly — it does not require the
+history file, only `to previous` does.
+
+## Target access (DOCKER_HOST)
+
+`scripts/rollback.sh` runs `docker compose pull && docker compose up -d`
+against the **target's** Docker daemon, never the machine it runs on. It
+requires `TARGET_HOST` and `TARGET_USER` (same values as the GitHub secrets
+of the same name) exported before it runs:
+
+```
+export TARGET_HOST=<same value as the GitHub secret TARGET_HOST>
+export TARGET_USER=<same value as the GitHub secret TARGET_USER>
+```
+
+The script builds `DOCKER_HOST=ssh://$TARGET_USER@$TARGET_HOST` itself and
+fails fast (before touching `deploy/.env`) if either is missing — it never
+silently falls back to a local Docker daemon.
+
 ## Workflow
 
 1. Run `scripts/rollback.sh list` to display the current tag and the history.
 2. Help the user pick a target:
    - by SHA (from the history, or from `git log`),
    - by "previous" (the second line of `.image-history`, simplest case).
-3. Run `scripts/rollback.sh to <target>` (or `scripts/rollback.sh to previous`).
+3. With `TARGET_HOST`/`TARGET_USER` exported (see "Target access" above),
+   run `scripts/rollback.sh to <target>` (or `scripts/rollback.sh to previous`).
 4. Wait for `docker compose up -d` to report the containers as started.
 5. Invoke the `health-monitor` skill to validate the rolled-back version is healthy.
 
@@ -449,6 +532,8 @@ Suggested next: health-monitor (verify the rolled-back version is healthy)
   bug still needs a forward fix.
 - Display the diff (`git log <from>..<to>`) if both SHAs are available, so the
   user knows what's being reverted.
+- `deploy/.image-history` is local to this clone, not shared state — don't
+  treat an empty or short history as "no previous deploys ever happened".
 EOF
 
 cat > "$SKILLS_DIR/rollback-manager/scripts/rollback.sh" <<'EOF'
@@ -468,6 +553,21 @@ HISTORY="${DEPLOY_DIR}/.image-history"
 
 current_tag() { grep '^IMAGE_TAG=' "$ENV_FILE" | cut -d= -f2; }
 
+# _require_docker_host — construit et exporte DOCKER_HOST=ssh://user@host
+# (port optionnel via TARGET_PORT) depuis TARGET_USER/TARGET_HOST (mêmes
+# valeurs que les secrets GitHub du même nom). Sans ça, le `docker compose
+# pull`/`up -d` plus bas parlerait au démon Docker LOCAL de la machine qui
+# exécute ce script — jamais celui de la cible : ce script tournerait alors
+# en silence contre le mauvais démon, potentiellement en démarrant des
+# conteneurs sur le poste du développeur. Appelée avant toute écriture dans
+# deploy/.env : en cas de variable manquante, rien n'est modifié sur disque.
+_require_docker_host() {
+  : "${TARGET_HOST:?TARGET_HOST required (same value as the GitHub secret TARGET_HOST) - this script drives the Docker daemon on the target, never the local one}"
+  : "${TARGET_USER:?TARGET_USER required (same value as the GitHub secret TARGET_USER)}"
+  DOCKER_HOST="ssh://${TARGET_USER}@${TARGET_HOST}${TARGET_PORT:+:${TARGET_PORT}}"
+  export DOCKER_HOST
+}
+
 case "${1:?usage: rollback.sh list|to <target>}" in
   list)
     echo "Current tag: $(current_tag)"
@@ -476,13 +576,14 @@ case "${1:?usage: rollback.sh list|to <target>}" in
     ;;
 
   to)
+    _require_docker_host
     target="${2:?usage: rollback.sh to previous|<sha>}"
     if [[ "$target" == "previous" ]]; then
       [[ -f "$HISTORY" ]] || { echo "no history available" >&2; exit 1; }
       target=$(sed -n '2p' "$HISTORY")
       [[ -n "$target" ]] || { echo "no previous tag available" >&2; exit 1; }
     fi
-    echo "Rollback: $(current_tag) -> ${target}"
+    echo "Rollback: $(current_tag) -> ${target} (DOCKER_HOST=${DOCKER_HOST})"
     sed -i.bak "s/^IMAGE_TAG=.*/IMAGE_TAG=${target}/" "$ENV_FILE"
     rm -f "${ENV_FILE}.bak"
     (cd "$DEPLOY_DIR" && docker compose pull && docker compose up -d --remove-orphans)
