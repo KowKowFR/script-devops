@@ -6,6 +6,12 @@ Docker. Ce fichier attaque la regex qui le protège avec les mêmes vecteurs
 que ceux qui ont historiquement traversé une validation trop permissive :
 traversée de chemin, ancre de fin mal posée, caractères qui ressemblent à des
 lettres ASCII sans en être, octets de contrôle injectés.
+
+Il vérifie aussi le CONTENU des messages d'erreur, pas seulement qu'une
+ValidationError est levée : le chemin normal (contraintes Pydantic
+déclaratives) produit par défaut des messages automatiques figés en anglais
+("String should match pattern…") — voir le docstring de panel/spec.py pour
+le choix d'implémentation qui les remplace par du français explicite.
 """
 import re
 
@@ -21,6 +27,57 @@ def _spec(**kw) -> dict:
                           "health": "/health", "expose": "/api/"}]}
     base.update(kw)
     return base
+
+
+def _messages(payload: dict) -> list[str]:
+    """Les messages d'erreur bruts d'un AppSpec.model_validate(payload) refusé."""
+    with pytest.raises(ValidationError) as exc_info:
+        AppSpec.model_validate(payload)
+    return [err["msg"] for err in exc_info.value.errors()]
+
+
+# --- Les messages d'erreur du chemin principal sont en français -------------
+# (et disent ce qui est attendu, pas seulement que c'est refusé)
+
+def test_message_nom_invalide_est_en_francais_et_explicite():
+    msgs = _messages(_spec(name="Mon App"))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "minuscule" in msg and "chiffre" in msg and "tiret" in msg
+    assert "commençant par une lettre" in msg
+    assert "entre 2 et 31 caractères" in msg
+    # Aucun jargon regex imposé à l'utilisateur, aucun message automatique anglais.
+    assert "should match pattern" not in msg.lower()
+
+
+def test_message_service_sans_expose_est_en_francais_et_explicite():
+    msgs = _messages(_spec(services=[
+        {"id": "db", "image": "postgres:16-alpine", "internal": True}]))
+    assert len(msgs) == 1
+    assert "expose" in msgs[0] and "joignable" in msgs[0]
+
+
+def test_message_champ_inconnu_est_en_francais_et_nomme_le_champ():
+    msgs = _messages(_spec(couleur_preferee="bleu"))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "couleur_preferee" in msg
+    assert "not permitted" not in msg.lower()  # pas le message anglais par défaut
+
+    msgs = _messages(_spec(services=[
+        {"id": "api", "build": "./a", "port": 3000, "expose": "/", "unknown": 1}]))
+    assert len(msgs) == 1
+    assert "unknown" in msgs[0]
+
+
+def test_message_port_hors_bornes_est_en_francais_et_donne_les_bornes():
+    msgs = _messages(_spec(services=[
+        {"id": "api", "build": "./a", "port": 99999, "expose": "/"}]))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "99999" in msg
+    assert "1" in msg and "65535" in msg
+    assert "less than or equal to" not in msg.lower()  # pas le message anglais par défaut
 
 
 # --- Le nom d'application : la vraie barrière -------------------------------
@@ -105,6 +162,34 @@ def test_ids_de_service_uniques_et_conformes():
         AppSpec.model_validate(_spec(services=[{"id": "a b", "build": "./a", "port": 3000}]))
 
 
+def test_id_de_service_a_32_caracteres_est_accepte():
+    id32 = "a" * 32
+    spec = AppSpec.model_validate(_spec(services=[
+        {"id": id32, "build": "./a", "port": 3000, "expose": "/"}]))
+    assert spec.services[0].id == id32
+
+
+def test_id_de_service_trop_long_est_refuse():
+    """La limite à 32 caractères est une marge du panneau (spec_init de
+    l'engine, lui, n'a aucune limite de longueur) — mais elle doit être
+    couverte par un test, pas seulement documentée en commentaire."""
+    with pytest.raises(ValidationError):
+        AppSpec.model_validate(_spec(services=[
+            {"id": "a" * 33, "build": "./a", "port": 3000, "expose": "/"}]))
+
+
+def test_message_id_de_service_invalide_est_en_francais():
+    msgs = []
+    with pytest.raises(ValidationError) as exc_info:
+        AppSpec.model_validate(_spec(services=[
+            {"id": "a" * 33, "build": "./a", "port": 3000, "expose": "/"}]))
+    msgs = [err["msg"] for err in exc_info.value.errors()]
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "lettre" in msg and "chiffre" in msg and "32 caractères" in msg
+    assert "should match pattern" not in msg.lower()
+
+
 def test_expose_et_internal_sont_exclusifs():
     with pytest.raises(ValidationError):
         AppSpec.model_validate(_spec(services=[
@@ -139,7 +224,9 @@ def test_deux_services_ne_peuvent_pas_exposer_le_meme_chemin():
             {"id": "web", "build": "./b", "port": 8080, "expose": "/"}]))
 
 
-def test_extra_forbid_sur_appspec_et_servicespec():
+def test_champs_inconnus_refuses_sur_appspec_et_servicespec():
+    """extra='allow' + rejet manuel dans _coherence, pas extra='forbid' : voir
+    le docstring de panel/spec.py. Le comportement (refus) doit être identique."""
     with pytest.raises(ValidationError):
         AppSpec.model_validate(_spec(unknown_field=True))
     with pytest.raises(ValidationError):
