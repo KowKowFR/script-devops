@@ -33,9 +33,9 @@ secrets
 # config Lima générée, alias SSH — jamais dans une image.
 .test-target
 
-# Ancien panneau Flask, supprimé au jalon 2 ; documentation et tests ne
-# font pas partie de l'image servie.
-web
+# Documentation et tests ne font pas partie de l'image servie. (web/,
+# l'ancien panneau Flask, a été supprimé du dépôt à la tâche 1 : plus
+# besoin de l'exclure ici, il n'existe plus.)
 docs
 tests
 

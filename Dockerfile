@@ -15,19 +15,27 @@ FROM python:3.12-slim AS base
 #     si target.auth_method=password (peut varier d'une cible à l'autre :
 #     on l'embarque toujours plutôt que de faire dépendre l'image de la
 #     configuration d'une cible particulière)
-#   gh, ssh-keygen                                      -> requis seulement
-#     si github.enabled=true ; gh est volontairement ABSENT ici, les étapes
-#     github_* de l'engine sont neutralisées par requires_flag côté panel
-#     tant que ce drapeau est faux (cf. pipeline.py, docs du jalon 2) ;
-#     ssh-keygen fait partie du paquet openssh-client et est donc déjà
-#     présent, sans coût supplémentaire.
+#   gh                                                   -> requis seulement
+#     si github.enabled=true. Contrairement à ce que ce commentaire disait
+#     avant correction : les quatre fonctions step_github_* (create_repo,
+#     set_secrets, git_init, git_push) sont bien implémentées dans
+#     engine/lib/steps.sh depuis main@4bcb575 — ce n'est donc plus une
+#     fonctionnalité absente à contourner, mais une fonctionnalité réelle
+#     que cette image doit pouvoir servir. gh est donc installé
+#     systématiquement ci-dessous ; seul le drapeau github.enabled décide,
+#     à l'exécution, si les étapes qui l'utilisent tournent.
+#   ssh-keygen                                          -> requis seulement
+#     si github.enabled=true ET target.auth_method=key ; fait partie du
+#     paquet openssh-client, donc déjà présent sans coût supplémentaire.
 #
 # bash : engine/bootstrap.sh et toute sa lib (lib/*.sh) sont écrits pour
 # bash, pas sh — l'image slim de base ne l'a pas par défaut.
 # ca-certificates : requis pour que curl/git/ssh vérifient les certificats
-# TLS (dépôt Docker plus bas, et toute cible HTTPS que l'engine contacte).
-# gnupg : nécessaire à l'installation du dépôt apt Docker ci-dessous
-#   (vérification de la clé de signature).
+# TLS (dépôts apt plus bas, et toute cible HTTPS que l'engine contacte).
+# gnupg : nécessaire le temps d'ajouter les dépôts apt Docker et GitHub CLI
+#   ci-dessous (vérification de leur clé de signature) ; purgé dans cette
+#   même couche une fois les paquets installés, il ne persiste pas dans
+#   l'image finale.
 # openssh-client : fournit le VRAI binaire ssh, ainsi que scp et
 #   ssh-keygen. C'est le binaire que Docker invoque lui-même, sans -i,
 #   quand DOCKER_HOST=ssh:// — le wrapper posé par
@@ -42,15 +50,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
 https://download.docker.com/linux/debian $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
       > /etc/apt/sources.list.d/docker.list \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli.gpg \
+ && chmod a+r /etc/apt/keyrings/githubcli.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli.gpg] \
+https://cli.github.com/packages/stable/apt/ stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+ && apt-get install -y --no-install-recommends \
+      docker-ce-cli docker-compose-plugin gh \
+ && apt-get purge -y --auto-remove gnupg \
  && rm -rf /var/lib/apt/lists/*
-# docker-ce-cli   : le CLIENT docker (requis["docker"]). Aucun démon n'est
-#   installé ici, et /var/run/docker.sock n'est monté nulle part — le
-#   worker pilote une cible distante via DOCKER_HOST=ssh://, jamais le
-#   socket local. Invariant du projet, pas une omission.
+# docker-ce-cli   : le CLIENT docker (requis["docker"]). Aucun démon Docker
+#   n'est installé dans cette image, et rien n'y monte le socket du démon
+#   de l'hôte — le worker pilote toujours un démon DISTANT, par SSH
+#   (DOCKER_HOST=ssh://…), jamais un démon local. Invariant du projet, pas
+#   une omission.
 # docker-compose-plugin : le plugin "docker compose" que check_prereqs
 #   vérifie par `docker compose version`.
+# gh : le client GitHub CLI, installé depuis son propre dépôt apt (le même
+#   mécanisme signed-by que pour Docker) plutôt que depuis Debian, pour une
+#   version à jour indépendamment de l'image de base.
 
 # UID fixe et non-root : le volume runs/ est partagé entre panel et worker,
 # les deux doivent lire et écrire les mêmes fichiers en 600. useradd -m crée
