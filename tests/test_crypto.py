@@ -25,17 +25,36 @@ def _caches_propres():
 
 
 def _aucune_fuite(exc_info, *fragments: str) -> None:
-    """Vérifie qu'aucun des `fragments` (la clé, un extrait) n'apparaît ni
-    dans le message de l'exception, ni dans sa trace complète — y compris la
-    chaîne d'exceptions (`__cause__`/`__context__`) que `traceback.format_exception`
-    donnerait à un gestionnaire de log générique."""
-    message = str(exc_info.value)
+    """Vérifie qu'aucun des `fragments` (la clé, un extrait) n'apparaît :
+    - dans le message de l'exception ;
+    - dans sa trace complète formatée (`traceback.format_exception`), celle
+      qu'afficherait un gestionnaire de log générique ;
+    - dans `__cause__` ET dans `__context__` pris isolément — un code qui
+      parcourt la chaîne d'exceptions sans respecter le drapeau
+      `__suppress_context__` (agrégateur d'erreurs, débogueur, `f"{e} / cause :
+      {e.__context__}"`) verrait sinon encore la clé, `from None` ne
+      protégeant que l'affichage par défaut, pas l'objet `__context__` lui-même.
+
+    Exige en plus que `__context__` soit strictement `None`, pas seulement
+    dépourvu du fragment : c'est la seule garantie qui tienne quelle que soit
+    l'exception d'origine.
+    """
+    exc = exc_info.value
+    message = str(exc)
     trace = "".join(
-        traceback.format_exception(exc_info.type, exc_info.value, exc_info.tb)
+        traceback.format_exception(exc_info.type, exc, exc_info.tb)
     )
+    assert exc.__context__ is None, (
+        f"__context__ n'est pas None : {exc.__context__!r} — "
+        "la chaîne implicite fuit encore, même si l'affichage la masque"
+    )
+    cause_texte = str(exc.__cause__)
+    contexte_texte = str(exc.__context__)
     for fragment in fragments:
         assert fragment not in message
         assert fragment not in trace
+        assert fragment not in cause_texte
+        assert fragment not in contexte_texte
 
 
 def test_aller_retour():

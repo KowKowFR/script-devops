@@ -45,26 +45,46 @@ def _box() -> Fernet:
     """Construit (une seule fois) la boîte Fernet à partir de PANEL_SECRET_KEY.
 
     Aucun message d'erreur ni aucune trace ne doit jamais faire apparaître la
-    valeur de la clé : c'est pourquoi chaque échec ici est reformulé en
-    `SecretError` avec un message fixe, et lève `... from None` pour couper
-    le chaînage vers l'exception d'origine (ValidationError pydantic ou
-    erreur du décodeur base64), qui elle embarque la valeur reçue.
+    valeur de la clé. `raise ... from None` ne suffit pas : il met à `None`
+    le `__cause__` explicite et pose `__suppress_context__` (qui ne fait que
+    demander au *formateur* de ne pas afficher la chaîne), mais Python
+    remplit quand même `__context__` avec l'exception en cours de traitement
+    au moment du `raise` — qui, elle, embarque la valeur reçue
+    (ValidationError pydantic : `input_value=...`). Un code qui inspecte
+    `__context__` directement (agrégateur d'erreurs, gestionnaire de log
+    maison, débogueur) verrait donc quand même la clé.
+
+    La seule garantie fiable : ne jamais lever `SecretError` alors qu'une
+    exception est activement gérée. On collecte donc un simple drapeau dans
+    chaque bloc `except`, et le `raise` final s'exécute une fois tous les
+    blocs `try/except` terminés — à ce point, `sys.exc_info()` est vide et
+    `SecretError.__context__` vaut `None`, pas seulement masqué à l'affichage.
     """
+    cle = ""
+    invalide = False
+
     try:
         cle = get_settings().secret_key.get_secret_value()
     except ValidationError:
         # Clé absente de l'environnement, ou trop courte : pydantic lève ici
-        # avant même que ce module ne voie la valeur — mais son message à
-        # lui la contient (input_value=...). On ne le propage jamais.
-        raise SecretError(_MESSAGE_CLE_INVALIDE) from None
+        # avant même que ce module ne voie la valeur.
+        invalide = True
 
-    if not _CLE_VALIDE.fullmatch(cle):
+    if not invalide and not _CLE_VALIDE.fullmatch(cle):
+        invalide = True
+
+    boite: Fernet | None = None
+    if not invalide:
+        try:
+            boite = Fernet(cle.encode())
+        except (ValueError, TypeError):
+            invalide = True
+
+    if invalide:
         raise SecretError(_MESSAGE_CLE_INVALIDE)
 
-    try:
-        return Fernet(cle.encode())
-    except (ValueError, TypeError):
-        raise SecretError(_MESSAGE_CLE_INVALIDE) from None
+    assert boite is not None  # garanti par la construction ci-dessus
+    return boite
 
 
 def encrypt(clair: str) -> str:
