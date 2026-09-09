@@ -13,11 +13,16 @@ runs/
 .bootstrap.web.pid
 tp-devops-agent-ia/
 
-# Web UI : venv + caches Python
-web/venv/
-web/__pycache__/
-web/**/__pycache__/
+# Panneau Python (jalon 2) : environnement virtuel, caches, secrets locaux
+.venv/
+__pycache__/
 *.pyc
+.pytest_cache/
+.env
+*.egg-info/
+
+# Secrets Docker locaux montés dans panel/worker (jalon 2, tâches 20-21)
+secrets/
 
 # OS
 .DS_Store
