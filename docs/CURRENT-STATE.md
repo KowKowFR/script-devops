@@ -1,20 +1,36 @@
-# État des lieux — 8 septembre 2026
+# État des lieux — 9 septembre 2026
 
 Instantané factuel. Il est daté parce qu'il périme vite.
 
 Pour le périmètre et la cible, voir [ROADMAP.md](ROADMAP.md). Pour qui fait quoi,
 voir [TEAM-SPLIT.md](TEAM-SPLIT.md).
 
-**Dernier commit relevé :** `6577b0d` — 34 commits depuis le début du jalon 1.
+**Jalon 1 : TERMINÉ.** 15 tâches sur 15, 255 assertions vertes.
+Le pipeline complet a été exécuté contre une vraie machine Ubuntu.
 **Dépôt public :** https://github.com/KowKowFR/script-devops
 
 ---
 
 ## En une phrase
 
-L'engine bash a quitté Kubernetes pour Docker Compose, il exécute une étape
-nommée à partir de paramètres JSON, et toutes ses étapes sont réécrites. Il reste
-deux tâches pour finir le jalon 1 ; le panneau Python n'existe pas encore.
+L'engine bash a quitté Kubernetes pour Docker Compose et **déploie réellement** :
+il a installé Docker sur une Ubuntu vierge, construit les images sur la cible,
+démarré la stack et validé sa santé. Le jalon 1 est terminé ; le plan du jalon 2
+est écrit et le panneau Python reste à construire.
+
+## La preuve qui compte
+
+```
+$ bash engine/bootstrap.sh --workspace testvm --step validate_deployment
+{"ok":true,"data":{"services_ok":2}}
+
+$ ssh <cible> 'docker ps'
+tp-app-api-1    Up (healthy)
+tp-app-web-1    Up (healthy)
+```
+
+Contre une VM Lima Ubuntu 24.04, en SSH sur le port 60122, sans aucune entrée
+dans le `~/.ssh/config` de la machine hôte.
 
 ---
 
