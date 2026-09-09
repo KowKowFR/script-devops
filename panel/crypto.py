@@ -12,9 +12,11 @@ Le déchiffrement n'a lieu que dans le processus WORKER, au moment d'écrire
 runs/<slug>/env.json (cf. panel/runspace.py). Le processus panel chiffre à
 l'entrée et ne déchiffre jamais : aucun endpoint ne renvoie un secret.
 """
+import re
 from functools import lru_cache
 
 from cryptography.fernet import Fernet, InvalidToken
+from pydantic import ValidationError
 
 from panel.settings import get_settings
 
@@ -23,16 +25,46 @@ class SecretError(RuntimeError):
     """Clé absente/invalide, ou jeton illisible avec la clé courante."""
 
 
+_MESSAGE_CLE_INVALIDE = (
+    "PANEL_SECRET_KEY absente ou invalide : 32 octets encodés en base64 "
+    "url-safe attendus, sans espace ni retour à la ligne (Fernet.generate_key())"
+)
+
+# Une clé Fernet valide fait exactement 44 caractères : 43 caractères de
+# l'alphabet base64 url-safe suivis d'un unique '=' de bourrage (32 octets
+# encodés). Le décodeur base64 standard ignore silencieusement les
+# caractères hors alphabet (espace, "\n" en tête ou en fin de valeur après
+# un copier-coller de .env) : on valide donc nous-mêmes le format exact
+# avant de le tendre à Fernet, plutôt que de laisser une clé légèrement
+# corrompue « marcher par accident ».
+_CLE_VALIDE = re.compile(r"^[A-Za-z0-9_-]{43}=$")
+
+
 @lru_cache
 def _box() -> Fernet:
-    key = get_settings().secret_key
+    """Construit (une seule fois) la boîte Fernet à partir de PANEL_SECRET_KEY.
+
+    Aucun message d'erreur ni aucune trace ne doit jamais faire apparaître la
+    valeur de la clé : c'est pourquoi chaque échec ici est reformulé en
+    `SecretError` avec un message fixe, et lève `... from None` pour couper
+    le chaînage vers l'exception d'origine (ValidationError pydantic ou
+    erreur du décodeur base64), qui elle embarque la valeur reçue.
+    """
     try:
-        return Fernet(key.encode())
-    except (ValueError, TypeError) as exc:
-        raise SecretError(
-            "PANEL_SECRET_KEY invalide : 32 octets encodés en base64 url-safe "
-            "attendus (Fernet.generate_key())"
-        ) from exc
+        cle = get_settings().secret_key.get_secret_value()
+    except ValidationError:
+        # Clé absente de l'environnement, ou trop courte : pydantic lève ici
+        # avant même que ce module ne voie la valeur — mais son message à
+        # lui la contient (input_value=...). On ne le propage jamais.
+        raise SecretError(_MESSAGE_CLE_INVALIDE) from None
+
+    if not _CLE_VALIDE.fullmatch(cle):
+        raise SecretError(_MESSAGE_CLE_INVALIDE)
+
+    try:
+        return Fernet(cle.encode())
+    except (ValueError, TypeError):
+        raise SecretError(_MESSAGE_CLE_INVALIDE) from None
 
 
 def encrypt(clair: str) -> str:

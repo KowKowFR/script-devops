@@ -28,3 +28,18 @@ def test_runs_dir_et_engine_sont_absolus(monkeypatch):
     assert s.runs_dir.is_absolute()
     assert s.engine_path.is_absolute()
     assert s.engine_path.name == "bootstrap.sh"
+
+
+def test_secret_key_masque_dans_toute_representation(monkeypatch):
+    # Un objet Settings journalisé (gestionnaire d'exception générique, mode
+    # debug de FastAPI) ne doit jamais faire fuiter la clé de chiffrement,
+    # quelle que soit la représentation textuelle utilisée.
+    cle = "s3cr3t-valeur-a-ne-jamais-afficher-000!"
+    monkeypatch.setenv("PANEL_SECRET_KEY", cle)
+    s = Settings()
+    assert cle not in repr(s)
+    assert cle not in str(s)
+    assert cle not in str(vars(s))
+    assert cle not in str(s.model_dump())
+    assert cle not in s.model_dump_json()
+    assert s.secret_key.get_secret_value() == cle
