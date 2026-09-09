@@ -11,8 +11,14 @@ Il vérifie aussi le CONTENU des messages d'erreur, pas seulement qu'une
 ValidationError est levée : le chemin normal (contraintes Pydantic
 déclaratives) produit par défaut des messages automatiques figés en anglais
 ("String should match pattern…") — voir le docstring de panel/spec.py pour
-le choix d'implémentation qui les remplace par du français explicite.
+le choix d'implémentation qui les remplace par du français explicite. Et,
+plus subtil, que ces messages ne reproduisent jamais une saisie utilisateur
+brute : un octet de contrôle ou une séquence ANSI doit y apparaître échappé
+(repr()), et une saisie démesurée doit y être tronquée — sans quoi le message
+d'erreur lui-même devient un vecteur (injection dans un terminal/log qui
+l'affiche, amplification gratuite d'une saisie surdimensionnée).
 """
+import json
 import re
 
 import pytest
@@ -80,6 +86,100 @@ def test_message_port_hors_bornes_est_en_francais_et_donne_les_bornes():
     assert "less than or equal to" not in msg.lower()  # pas le message anglais par défaut
 
 
+def test_message_champ_inconnu_echappe_les_caracteres_dangereux():
+    """Un nom de champ contenant une séquence ANSI et un octet nul ne doit
+    jamais apparaître BRUT dans le message : repr() les rend inoffensifs
+    (mêmes caractères, sous forme d'échappements littéraux \\x1b, \\x00),
+    sûr pour un terminal ou un fichier de log qui l'afficherait tel quel."""
+    champ_dangereux = "mon\x1b[31mchamp\x00"
+
+    msgs = _messages(_spec(**{champ_dangereux: "valeur"}))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "\x1b" not in msg and "\x00" not in msg
+    assert "\\x1b" in msg and "\\x00" in msg
+
+    # Même précaution côté ServiceSpec (l'autre validateur de cohérence qui
+    # rejette les champs inconnus).
+    msgs = _messages(_spec(services=[
+        {"id": "api", "build": "./a", "port": 3000, "expose": "/",
+         champ_dangereux: "valeur"}]))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "\x1b" not in msg and "\x00" not in msg
+    assert "\\x1b" in msg and "\\x00" in msg
+
+
+def test_message_valeur_geante_est_tronque():
+    """Une entrée de 100 000 caractères ne doit pas repartir intégralement
+    dans le message : amplification gratuite d'une saisie surdimensionnée
+    dans une réponse 422 et dans les logs qui la reprennent."""
+    nom_geant = "a" * 100_000
+    msgs = _messages(_spec(name=nom_geant))
+    assert len(msgs) == 1
+    assert len(msgs[0]) < 500
+    assert "tronqué" in msgs[0]
+    assert nom_geant not in msgs[0]
+
+    champ_geant = "x" * 100_000
+    msgs = _messages(_spec(**{champ_geant: "valeur"}))
+    assert len(msgs) == 1
+    assert len(msgs[0]) < 500
+    assert "tronqué" in msgs[0]
+    assert champ_geant not in msgs[0]
+
+
+# --- Les erreurs de TYPE (avant tout field_validator/model_validator Python) -
+# Couverture volontairement non exhaustive : voir « CE QUI RESTE
+# VOLONTAIREMENT EN ANGLAIS » dans le docstring de panel/spec.py.
+
+def test_message_nom_non_chaine_est_en_francais():
+    msgs = _messages(_spec(name=123))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "chaîne de caractères" in msg
+    assert "123" in msg
+    assert "valid string" not in msg.lower()
+
+
+def test_message_port_non_numerique_est_en_francais():
+    msgs = _messages(_spec(services=[
+        {"id": "api", "build": "./a", "port": "abc", "expose": "/"}]))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "nombre entier" in msg
+    assert "abc" in msg
+    assert "unable to parse" not in msg.lower()
+
+
+def test_message_services_non_liste_est_en_francais():
+    msgs = _messages(_spec(services="pas-une-liste"))
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "liste" in msg
+    assert "valid list" not in msg.lower()
+
+
+def test_message_nom_absent_est_en_francais():
+    payload = {k: v for k, v in _spec().items() if k != "name"}
+    msgs = _messages(payload)
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert "requis" in msg or "absent" in msg
+    assert "field required" not in msg.lower()
+
+
+def test_model_validate_json_traduit_aussi_les_erreurs_de_type():
+    """AppSpec.model_validate_json est le chemin qu'emprunte un corps de
+    requête HTTP brut — doit bénéficier de la même traduction que
+    model_validate."""
+    with pytest.raises(ValidationError) as exc_info:
+        AppSpec.model_validate_json(json.dumps(_spec(name=123)))
+    msg = exc_info.value.errors()[0]["msg"]
+    assert "chaîne de caractères" in msg
+    assert "valid string" not in msg.lower()
+
+
 # --- Le nom d'application : la vraie barrière -------------------------------
 
 @pytest.mark.parametrize("nom", ["a" * 31, "mon-app", "app1", "web-front-2", "aa"])
@@ -98,6 +198,7 @@ def test_noms_valides(nom):
     "-app",               # commence par un tiret
     "a",                  # trop court (2 caractères minimum)
     "a" * 32,             # 32 caractères : un de trop
+    "a" * 100_000,        # amplification / recherche de ReDoS
     "mon app",            # espace
     "mon.app",
     "mon;app",

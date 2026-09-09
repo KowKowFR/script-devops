@@ -35,11 +35,32 @@ chaque message avec la règle qu'il décrit (pas de table de traduction à tenir
 synchronisée à part), et c'est exactement le même mécanisme que celui déjà
 utilisé pour les règles de cohérence métier (build XOR image, expose
 exclusif d'internal…) plus bas dans ce fichier.
+
+CE QUI RESTE VOLONTAIREMENT EN ANGLAIS.
+Les field_validator/model_validator ci-dessus ne s'exécutent qu'APRÈS que le
+cœur de pydantic-core a accepté le TYPE de chaque champ. Un JSON malformé
+(`"name": 123`, `"port": "abc"`, `"services": "pas-une-liste"`, `"name"`
+absent) est donc rejeté avant qu'aucun validateur Python ne tourne, avec les
+messages automatiques anglais habituels. `AppSpec.model_validate` /
+`model_validate_json` sont surchargés plus bas pour retraduire les quatre cas
+réellement atteignables par un appelant HTTP avec un JSON malformé
+(`_MESSAGES_TYPE_ERREUR`) — PAS l'intégralité des ~50 types d'erreur internes
+de pydantic-core, qui ne se rencontrent pas tous à cette frontière (des
+erreurs comme "trop d'éléments imbriqués" ou "récursion" ne sont pas des
+saisies utilisateur plausibles ici). Un type d'erreur non couvert par
+`_MESSAGES_TYPE_ERREUR` continue de produire son message pydantic-core
+d'origine (donc potentiellement en anglais) — assumé, documenté, pas une
+tentative ratée d'exhaustivité. La technique de retraduction elle-même (type
+"value_error" reconstruit avec un ValueError en `ctx`) est celle décrite par
+la documentation Pydantic pour la localisation de messages ; ce n'est pas une
+reconstruction par API privée.
 """
 import re
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import InitErrorDetails
+from pydantic_core import ValidationError as _CoreValidationError
 
 # D5 : sous-ensemble STRICT de la regex de workspace de l'engine
 # (^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$, cf. docs/ENGINE.md §1) — minuscules
@@ -60,6 +81,95 @@ AppName = str
 # tests/test_spec.py, qui couvre spécifiquement cette limite par mutation.
 SERVICE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,32}$"
 ServiceId = str
+
+# Longueur maximale d'une valeur utilisateur reproduite dans un message
+# d'erreur. Sans borne, une saisie de 100 000 caractères produit un message
+# 422 (et une ligne de log) de taille quasi identique : une amplification
+# gratuite, pas une évasion, mais un gaspillage qu'il est gratuit d'éviter.
+_LONGUEUR_MAX_VALEUR_DANS_MESSAGE = 80
+
+
+def _repr_tronque(valeur: Any, longueur_max: int = _LONGUEUR_MAX_VALEUR_DANS_MESSAGE) -> str:
+    """repr() sûr pour un message d'erreur.
+
+    repr() échappe les caractères de contrôle et les séquences ANSI en
+    échappements littéraux (\\x1b, \\x00…) — sûr pour un terminal, un fichier
+    de log ou une réponse JSON qu'un client pourrait afficher tel quel. La
+    troncature borne la taille de ce qu'une saisie utilisateur peut faire
+    gonfler en aval (réponse 422, logs), en l'indiquant explicitement.
+    """
+    r = repr(valeur)
+    if len(r) > longueur_max:
+        r = r[:longueur_max] + "…(tronqué)"
+    return r
+
+
+# --- Traduction des erreurs de TYPE de pydantic-core (avant tout validateur
+# Python — voir « CE QUI RESTE VOLONTAIREMENT EN ANGLAIS » dans le docstring
+# du module) -----------------------------------------------------------------
+
+def _chemin_lisible(loc: tuple) -> str:
+    """« ('services', 0, 'port') » → « services[0].port », pour un message lisible."""
+    parties: list[str] = []
+    for part in loc:
+        if isinstance(part, int) and parties:
+            parties[-1] = f"{parties[-1]}[{part}]"
+        else:
+            parties.append(str(part))
+    return ".".join(parties)
+
+
+_MESSAGES_TYPE_ERREUR = {
+    "string_type": lambda chemin, valeur: (
+        f"{chemin} : doit être une chaîne de caractères (texte) "
+        f"(reçu : {_repr_tronque(valeur)})"
+    ),
+    "int_parsing": lambda chemin, valeur: (
+        f"{chemin} : doit être un nombre entier (reçu : {_repr_tronque(valeur)})"
+    ),
+    "int_type": lambda chemin, valeur: (
+        f"{chemin} : doit être un nombre entier (reçu : {_repr_tronque(valeur)})"
+    ),
+    "list_type": lambda chemin, valeur: (
+        f"{chemin} : doit être une liste (reçu : {_repr_tronque(valeur)})"
+    ),
+    "missing": lambda chemin, _valeur: f"{chemin} : champ requis, absent de la description envoyée",
+}
+
+
+def _traduire_erreurs_de_type(exc: _CoreValidationError) -> _CoreValidationError:
+    """Reconstruit exc avec les erreurs de type couvertes par
+    _MESSAGES_TYPE_ERREUR en français ; relaie les autres telles quelles
+    (potentiellement en anglais — assumé, voir le docstring du module).
+
+    Technique documentée par Pydantic pour la localisation de messages :
+    chaque erreur retraduite devient de type 'value_error', portant le
+    message français dans ctx['error'] — pas une reconstruction par API
+    privée. Les erreurs déjà françaises (levées par nos propres
+    field_validator/model_validator, déjà de type 'value_error') traversent
+    ce mécanisme inchangées.
+    """
+    line_errors: list[InitErrorDetails] = []
+    a_traduire = False
+    for err in exc.errors():
+        formateur = _MESSAGES_TYPE_ERREUR.get(err["type"])
+        if formateur is None:
+            entree: InitErrorDetails = {
+                "type": err["type"], "loc": err["loc"], "input": err.get("input"),
+            }
+            if "ctx" in err:
+                entree["ctx"] = err["ctx"]
+            line_errors.append(entree)
+            continue
+        a_traduire = True
+        message = formateur(_chemin_lisible(err["loc"]), err.get("input"))
+        line_errors.append({
+            "type": "value_error", "loc": err["loc"], "input": err.get("input"),
+            "ctx": {"error": ValueError(message)},
+        })
+    if not a_traduire:
+        return exc
+    return _CoreValidationError.from_exception_data(title=exc.title, line_errors=line_errors)
 
 
 class ServiceSpec(BaseModel):
@@ -84,9 +194,9 @@ class ServiceSpec(BaseModel):
     def _valider_id(cls, v: str) -> str:
         if not re.fullmatch(SERVICE_ID_PATTERN, v):
             raise ValueError(
-                f"id de service invalide ({v!r}) : attendu des lettres, des "
-                "chiffres, '_' et '-' uniquement, entre 1 et 32 caractères "
-                "(exemple : 'api', 'web-front')"
+                f"id de service invalide ({_repr_tronque(v)}) : attendu des "
+                "lettres, des chiffres, '_' et '-' uniquement, entre 1 et 32 "
+                "caractères (exemple : 'api', 'web-front')"
             )
         return v
 
@@ -95,15 +205,35 @@ class ServiceSpec(BaseModel):
     def _valider_port(cls, v: int | None) -> int | None:
         if v is not None and not (1 <= v <= 65535):
             raise ValueError(
-                f"port invalide ({v}) : attendu un entier entre 1 et 65535 "
-                "(c'est le port sur lequel le conteneur écoute)"
+                f"port invalide ({_repr_tronque(v)}) : attendu un entier "
+                "entre 1 et 65535 (c'est le port sur lequel le conteneur "
+                "écoute)"
             )
         return v
+
+    @classmethod
+    def model_validate(cls, *args, **kwargs) -> Self:
+        try:
+            return super().model_validate(*args, **kwargs)
+        except _CoreValidationError as exc:
+            raise _traduire_erreurs_de_type(exc) from None
+
+    @classmethod
+    def model_validate_json(cls, *args, **kwargs) -> Self:
+        try:
+            return super().model_validate_json(*args, **kwargs)
+        except _CoreValidationError as exc:
+            raise _traduire_erreurs_de_type(exc) from None
 
     @model_validator(mode="after")
     def _coherence(self) -> Self:
         if self.model_extra:
-            inconnus = ", ".join(sorted(self.model_extra))
+            # repr() + troncature : un nom de champ contenant une séquence
+            # ANSI, un octet nul ou une saisie démesurée ne doit jamais
+            # atterrir brut dans une réponse 422 ni dans les logs qui la
+            # reprennent — même précaution que pour le nom d'application
+            # (valider_nom_application) et l'id de service ci-dessus.
+            inconnus = ", ".join(_repr_tronque(c) for c in sorted(self.model_extra))
             attendus = ", ".join(sorted(type(self).model_fields))
             raise ValueError(
                 f"service « {self.id} » : champ(s) inconnu(s) — {inconnus}. "
@@ -160,10 +290,34 @@ class AppSpec(BaseModel):
         # dernier recours. Un seul endroit à faire évoluer si la règle change.
         return valider_nom_application(v)
 
+    @classmethod
+    def model_validate(cls, *args, **kwargs) -> Self:
+        # Retraduit les erreurs de TYPE de pydantic-core (avant tout
+        # field_validator/model_validator Python, cf. « CE QUI RESTE
+        # VOLONTAIREMENT EN ANGLAIS » dans le docstring du module) — c'est le
+        # point d'entrée réel de l'API, donc celui où l'exigence de messages
+        # en français s'applique aussi aux erreurs de type, pas seulement de
+        # contenu. Les erreurs imbriquées (ServiceSpec au sein de 'services')
+        # remontent dans la MÊME ValidationError, donc une seule surcharge
+        # ici suffit à les couvrir aussi.
+        try:
+            return super().model_validate(*args, **kwargs)
+        except _CoreValidationError as exc:
+            raise _traduire_erreurs_de_type(exc) from None
+
+    @classmethod
+    def model_validate_json(cls, *args, **kwargs) -> Self:
+        try:
+            return super().model_validate_json(*args, **kwargs)
+        except _CoreValidationError as exc:
+            raise _traduire_erreurs_de_type(exc) from None
+
     @model_validator(mode="after")
     def _coherence(self) -> Self:
         if self.model_extra:
-            inconnus = ", ".join(sorted(self.model_extra))
+            # repr() + troncature : cf. le même traitement dans
+            # ServiceSpec._coherence, même raison.
+            inconnus = ", ".join(_repr_tronque(c) for c in sorted(self.model_extra))
             attendus = ", ".join(sorted(type(self).model_fields))
             raise ValueError(
                 f"champ(s) inconnu(s) dans la description de l'application : "
@@ -233,9 +387,12 @@ def valider_nom_application(nom: str) -> str:
     # ENTIÈRE, donc rejette bien ce cas. Vérifié empiriquement, et couvert
     # par mutation dans tests/test_spec.py.
     if not isinstance(nom, str) or not re.fullmatch(APP_NAME_PATTERN, nom):
+        # _repr_tronque, pas nom!r nu : échappe ET borne la taille — une
+        # saisie de 100 000 caractères ne doit pas se retrouver intégralement
+        # dans la réponse 422 ni dans les logs qui la reprennent.
         raise ValueError(
-            f"nom d'application invalide : {nom!r} — attendu des lettres "
-            "minuscules, des chiffres et des tirets, commençant par une "
-            "lettre, entre 2 et 31 caractères (exemple : 'mon-app')"
+            f"nom d'application invalide : {_repr_tronque(nom)} — attendu "
+            "des lettres minuscules, des chiffres et des tirets, commençant "
+            "par une lettre, entre 2 et 31 caractères (exemple : 'mon-app')"
         )
     return nom
