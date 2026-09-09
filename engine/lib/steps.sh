@@ -17,6 +17,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/gen_compose.sh"
 # shellcheck source=gen_microservices.sh
 source "$(dirname "${BASH_SOURCE[0]}")/gen_microservices.sh"
 
+# gen_compose.sh expose aussi `_capture` (VARNAME CMD... — équivalent de
+# VARNAME="$(CMD...)" qui reste correct quand CMD peut appeler `die`) : le
+# bloc GitHub plus bas la réutilise telle quelle plutôt que de dupliquer le
+# correctif — voir son commentaire dans gen_compose.sh pour le pourquoi.
+
 # ----- Pré-requis -----------------------------------------------------------
 step_check_prereqs() { check_prereqs; }
 
@@ -258,12 +263,41 @@ _github_skip_if_disabled() {
 
 _gh() {
   # gh s'authentifie par GH_TOKEN, jamais par `gh auth login` (interactif).
-  GH_TOKEN="$(cfg_req github.token)" gh "$@"
+  #
+  # BUG CORRIGÉ (revue) : `GH_TOKEN="$(cfg_req github.token)" gh "$@"`
+  # semblait sûr, ne l'était pas. En bash, une substitution de commande
+  # utilisée en PRÉFIXE d'affectation temporaire d'une autre commande fork un
+  # sous-shell pour cfg_req — son die() y appelle bien `exit 2`, mais ça ne
+  # quitte QUE ce sous-shell. Le code de sortie de la substitution n'est même
+  # plus regardé (seul celui de `gh` compte pour `set -e`) : `gh` s'exécute
+  # quand même, avec le JSON d'erreur de die() comme valeur de GH_TOKEN — un
+  # vrai appel réseau vers l'API GitHub avec un jeton corrompu au lieu d'un
+  # jeton absent. Reproduit en revue : `HTTP 401: Bad credentials`.
+  #
+  # `_capture` (définie dans gen_compose.sh, sourcé en tête de ce fichier)
+  # évite exactement ce piège : elle relaie le message de die() sur le VRAI
+  # stdout et sort avec le bon code AVANT que `gh` ne soit jamais invoqué.
+  local token; _capture token cfg_req github.token
+  GH_TOKEN="$token" gh "$@"
 }
 
 step_github_create_repo() {
   _github_skip_if_disabled && return 0
-  local repo; repo="$(cfg_req github.user)/$(cfg_req github.repo)"
+  local gh_user gh_repo
+  _capture gh_user cfg_req github.user
+  _capture gh_repo cfg_req github.repo
+  # github.token validé ICI, avant tout appel à _gh : plus bas, le premier
+  # appel (`_gh repo view ... >/dev/null 2>&1`) redirige stdout ET stderr
+  # vers /dev/null pour sonder discrètement l'existence du dépôt — un die()
+  # qui se déclencherait DANS cet appel (le contrôle interne de _gh sur
+  # github.token) verrait son JSON d'erreur avalé par cette redirection,
+  # PAS par un sous-shell cette fois, mais avec le même résultat : rien sur
+  # le vrai stdout, alors que _capture aurait déjà positionné
+  # _RESULT_EMITTED=1 — l'appelant ne verrait jamais aucune ligne JSON. En
+  # validant ici, hors de toute redirection, le die() (s'il a lieu) part
+  # bien sur le vrai stdout avant que _gh ne soit jamais invoqué.
+  local gh_token; _capture gh_token cfg_req github.token
+  local repo="${gh_user}/${gh_repo}"
 
   if _gh repo view "$repo" >/dev/null 2>&1; then
     if cfg_bool options.allow_existing_repo; then
@@ -283,18 +317,39 @@ step_github_create_repo() {
 
 step_github_set_secrets() {
   _github_skip_if_disabled && return 0
-  local repo; repo="$(cfg_req github.user)/$(cfg_req github.repo)"
+  local gh_user gh_repo
+  _capture gh_user cfg_req github.user
+  _capture gh_repo cfg_req github.repo
+  # github.token validé ICI (voir le commentaire équivalent dans
+  # step_github_create_repo) : tous les appels _gh plus bas redirigent leur
+  # stdout vers stderr (`>&2`), ce qui avalerait le JSON de die() si le
+  # contrôle interne de _gh se déclenchait pour la toute première fois à
+  # l'intérieur d'un de ces appels redirigés.
+  local gh_token; _capture gh_token cfg_req github.token
+  local repo="${gh_user}/${gh_repo}"
+
+  # Même piège que _gh ci-dessus pour CHAQUE valeur de secret : un
+  # `--body "$(cfg_req ...)"` swallow-erait un die() en secret corrompu
+  # (le JSON d'erreur posé tel quel comme valeur du secret GitHub), au lieu
+  # de faire échouer la génération avant tout appel réseau. `_capture`
+  # partout où une valeur requise nourrit un argument de commande.
+  local reg_user reg_token t_host t_user
+  _capture reg_user  cfg_req registry.user
+  _capture reg_token cfg_req registry.token
+  _capture t_host    cfg_req target.host
+  _capture t_user    cfg_req target.user
 
   local n=0
-  _gh secret set DOCKERHUB_USERNAME --repo "$repo" --body "$(cfg_req registry.user)" >&2 && n=$((n+1))
-  _gh secret set DOCKERHUB_TOKEN    --repo "$repo" --body "$(cfg_req registry.token)" >&2 && n=$((n+1))
-  _gh secret set TARGET_HOST        --repo "$repo" --body "$(cfg_req target.host)" >&2 && n=$((n+1))
-  _gh secret set TARGET_USER        --repo "$repo" --body "$(cfg_req target.user)" >&2 && n=$((n+1))
+  _gh secret set DOCKERHUB_USERNAME --repo "$repo" --body "$reg_user"  >&2 && n=$((n+1))
+  _gh secret set DOCKERHUB_TOKEN    --repo "$repo" --body "$reg_token" >&2 && n=$((n+1))
+  _gh secret set TARGET_HOST        --repo "$repo" --body "$t_host"    >&2 && n=$((n+1))
+  _gh secret set TARGET_USER        --repo "$repo" --body "$t_user"    >&2 && n=$((n+1))
 
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
-    _gh secret set TARGET_PASSWORD --repo "$repo" --body "$(cfg_req target.password)" >&2 && n=$((n+1))
+    local t_pass; _capture t_pass cfg_req target.password
+    _gh secret set TARGET_PASSWORD --repo "$repo" --body "$t_pass" >&2 && n=$((n+1))
   else
-    local key_path; key_path="$(cfg_req target.ssh_key_path)"
+    local key_path; _capture key_path cfg_req target.ssh_key_path
     ssh-keygen -y -f "$key_path" >/dev/null 2>&1 \
       || die "clé SSH invalide ou protégée par passphrase : ${key_path} (le runner CI ne peut pas la déverrouiller)" 2
     # Une clé sans saut de ligne final provoque "error in libcrypto" côté runner.
@@ -311,7 +366,10 @@ step_github_set_secrets() {
 
 step_git_init() {
   _github_skip_if_disabled && return 0
-  local url="https://github.com/$(cfg_req github.user)/$(cfg_req github.repo).git"
+  local gh_user gh_repo
+  _capture gh_user cfg_req github.user
+  _capture gh_repo cfg_req github.repo
+  local url="https://github.com/${gh_user}/${gh_repo}.git"
   (
     cd "$WORK_DIR" || exit 1
     [[ -d .git ]] || git init -q -b main
@@ -333,7 +391,15 @@ GITIGNORE
 
 step_git_push() {
   _github_skip_if_disabled && return 0
-  local user; user="$(cfg_req github.user)"
+  # user et token récupérés AVANT le sous-shell : à l'intérieur, un die() de
+  # cfg_req serait de toute façon avalé par le `|| retryable` qui l'entoure
+  # (code 1 générique "push impossible" au lieu du fatal nommant le
+  # paramètre manquant) — les valider ici garantit aussi qu'aucune commande
+  # git (donc aucun appel réseau) ne s'exécute avant que github.user/token
+  # ne soient confirmés présents.
+  local user token
+  _capture user cfg_req github.user
+  _capture token cfg_req github.token
   (
     cd "$WORK_DIR" || exit 1
     git add .
@@ -343,9 +409,10 @@ step_git_push() {
       git -c user.email="${user}@users.noreply.github.com" -c user.name="$user" \
           commit -q -m "chore: déploiement initial par DeployMatic"
     fi
-    GH_TOKEN="$(cfg_req github.token)" git push -u origin main
+    GH_TOKEN="$token" git push -u origin main
   ) >&2 || retryable "push vers origin/main impossible"
 
   ui_ok "Push réussi"
-  emit_ok "$(jq -cn --arg u "https://github.com/${user}/$(cfg_req github.repo)" '{repo_url: $u}')"
+  local repo; _capture repo cfg_req github.repo
+  emit_ok "$(jq -cn --arg u "https://github.com/${user}/${repo}" '{repo_url: $u}')"
 }

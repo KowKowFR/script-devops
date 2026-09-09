@@ -43,7 +43,11 @@ _target_port() {
 ssh_remote() {
   local port; port="$(_target_port)"
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
-    SSHPASS="$(cfg target.password)" sshpass -e ssh -p "$port" "${_ssh_password_opts[@]}" "$@"
+    # Affectation séparée de l'usage (pas de "VAR=\"\$(cfg ...)\" cmd") : par
+    # cohérence avec le correctif du bloc GitHub (steps.sh) même si `cfg` ne
+    # meurt jamais — elle renvoie juste vide si target.password est absent.
+    local pass; pass="$(cfg target.password)"
+    SSHPASS="$pass" sshpass -e ssh -p "$port" "${_ssh_password_opts[@]}" "$@"
   else
     ssh -i "$(cfg_req target.ssh_key_path)" \
         -p "$port" \
@@ -57,7 +61,8 @@ ssh_remote_tty() {
   # Identique à ssh_remote, mais alloue un TTY.
   local port; port="$(_target_port)"
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
-    SSHPASS="$(cfg target.password)" sshpass -e ssh -t -p "$port" "${_ssh_password_opts[@]}" "$@"
+    local pass; pass="$(cfg target.password)"
+    SSHPASS="$pass" sshpass -e ssh -t -p "$port" "${_ssh_password_opts[@]}" "$@"
   else
     ssh -t -i "$(cfg_req target.ssh_key_path)" \
         -p "$port" \
@@ -69,7 +74,8 @@ ssh_remote_tty() {
 scp_remote() {
   local port; port="$(_target_port)"
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
-    SSHPASS="$(cfg target.password)" sshpass -e scp -P "$port" "${_ssh_password_opts[@]}" "$@"
+    local pass; pass="$(cfg target.password)"
+    SSHPASS="$pass" sshpass -e scp -P "$port" "${_ssh_password_opts[@]}" "$@"
   else
     scp -i "$(cfg_req target.ssh_key_path)" \
         -P "$port" \
