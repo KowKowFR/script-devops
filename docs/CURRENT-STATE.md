@@ -1,4 +1,4 @@
-# État des lieux — 9 septembre 2026 (soir)
+# État des lieux — 9 septembre 2026 (nuit)
 
 Instantané factuel. Il est daté parce qu'il périme vite.
 
@@ -11,157 +11,169 @@ voir [TEAM-SPLIT.md](TEAM-SPLIT.md).
 
 ## En une phrase
 
-Le **jalon 1 est terminé et figé** : l'engine bash déploie réellement, vérifié
-contre une VM Ubuntu. Le **jalon 2 est en cours** : le squelette du panneau
-Python est sur `main`, sept tâches sont livrées et en cours de relecture dans des
-branches séparées.
+Le **jalon 1 est terminé et figé** — l'engine bash déploie réellement, vérifié
+contre une VM Ubuntu. Le **jalon 2 avance** : six tâches fusionnées, quatre
+livrées en attente de relecture, sur vingt-quatre.
 
 ---
 
 ## Jalon 1 — terminé
 
-255 assertions, `TOUT PASSE`. Le pipeline complet a tourné contre une VM Lima
+**272 assertions, `TOUT PASSE`.** Le pipeline complet a tourné contre une VM Lima
 Ubuntu 24.04 : Docker installé sur une machine vierge, images construites sur la
 cible, stack démarrée, santé validée.
 
-```
-$ bash engine/bootstrap.sh --workspace testvm --step validate_deployment
-{"ok":true,"data":{"services_ok":2}}
-```
-
-Le détail est dans [JALON-1-VERIFICATION.md](JALON-1-VERIFICATION.md), le contrat
-dans [ENGINE.md](ENGINE.md). **L'engine ne bouge plus** : le jalon 2 s'y branche
-sans le modifier.
+Détail dans [JALON-1-VERIFICATION.md](JALON-1-VERIFICATION.md), contrat dans
+[ENGINE.md](ENGINE.md). **L'engine ne bouge plus.**
 
 ---
 
-## Jalon 2 — en cours
+## Jalon 2 — 6 tâches sur 24
 
-**Sur `main` :** la tâche 1 seulement (squelette `panel/`, configuration typée,
-harnais pytest, suppression de l'ancienne interface Flask).
+**117 tests Python verts sur `main`.**
 
-**En attente de fusion :** sept tâches livrées, dans des branches séparées.
+### Fusionné
 
-| # | Tâche | Revue | État |
-|---|---|---|---|
-| 2 | `crypto.py` — chiffrement Fernet | ✅ spec, **Critical** | corrigée, à re-relire |
-| 3 | `models.py` + `db.py` | ✅ spec, intégrité non protégée | corrigée, en re-revue |
-| 4 | `spec.py` — validation | ❌ messages en anglais | correction en cours |
-| 5 | `pipeline.py` | ✅ approuvée | **prête à fusionner** |
-| 13 | `worker/logbus.py` | ✅ spec, 2 mutations survivaient | correction en cours |
-| 14 | `worker/engine.py` | en revue | |
-| 20 | `Dockerfile` | ✅ approuvée | correction mineure en cours |
+| # | Tâche | Rounds |
+|---|---|---|
+| 1 | Squelette, configuration typée, harnais pytest | — |
+| 2 | `crypto.py` — chiffrement Fernet | 3 |
+| 3 | `models.py` + `db.py` — modèle de données | 1 |
+| 4 | `spec.py` — validation du spec et du nom d'app | 3 |
+| 5 | `pipeline.py` — séquence et natures d'étape | — |
+| 13 | `worker/logbus.py` — journal + Redis | 2 |
+| 20 | `Dockerfile` — image commune | 1 |
 
-Restent à écrire : les tâches 6 à 12, 15 à 19, et 21 à 24.
+### Livré, en relecture
+
+| # | Tâche | État |
+|---|---|---|
+| 6 | `auth.py` — argon2id, session signée | en revue |
+| 8 | `api/app.py` — FastAPI, sondes de santé | en revue |
+| 12 | `runspace.py` — matérialisation de `runs/<slug>/` | en revue |
+| 14 | `worker/engine.py` — invocation de l'engine | en re-revue |
+
+### Reste à écrire
+
+Tâches 7, 9, 10, 11, 15 à 19, et 21 à 24.
 
 ---
 
-## Ce que la vérification par mutation a révélé
+## La preuve du jour
 
-C'est le fait marquant de cette vague, et il vaut d'être retenu.
+Le panneau écrit un `env.json`, l'engine le lit :
 
-**Quatre tâches sur sept avaient des tests qui ne testaient pas ce qu'ils
-annonçaient.** Toutes auraient été jugées bien couvertes à la lecture.
+```
+$ bash engine/bootstrap.sh --workspace preuve-app --step check_prereqs
+{"ok":true,"data":{"checked":7}}
+```
+
+Le pont Python → bash fonctionne, vérifié en exécution et pas sur schéma.
+
+---
+
+## Ce que les revues ont trouvé
+
+Sur onze tâches relues, **aucune n'est passée sans finding**. Le mode de
+découverte compte autant que les défauts eux-mêmes : tous ont été trouvés en
+**exécutant, mutant ou attaquant**, jamais en relisant.
+
+### Trois défauts sérieux, tous issus du plan
+
+**Une fuite de la clé de chiffrement.** Une clé trop courte faisait lever pydantic
+avec la valeur en clair dans le message. Corrigée — puis une **seconde fuite** par
+`__context__`, que `raise ... from None` ne ferme pas : Python garde l'exception
+d'origine et se contente d'un drapeau d'affichage. La correction retenue ne lève
+plus jamais depuis l'intérieur d'un `except`.
+
+**Deux endroits où un worker pouvait se figer pour toujours.** La lecture
+séquentielle de stderr neutralisait le timeout. Corrigée par un thread — puis la
+lecture de stdout, trois lignes plus loin, s'est révélée avoir **exactement le même
+défaut**, reproductible sans aucun signal externe.
+
+**Une regex qui laissait passer un retour à la ligne** dans un nom devenant chemin
+de fichier, de projet Compose et de réseau Docker : en Python, `$` matche juste
+avant un `\n` final.
+
+### Cinq suites de tests qui ne testaient pas ce qu'elles annonçaient
 
 | Tâche | Mutation qui survivait |
 |---|---|
-| 2 | Supprimer **toute** la gestion d'erreur de clé — 6/6 verts |
-| 13 | Retirer le vidage ligne à ligne, cœur du commit — 6/6 verts |
-| 3 | Retirer une clé étrangère, rendre une colonne nullable — 6/6 verts |
-| 4 | Retirer la limite de longueur des identifiants — 56/56 verts |
+| 2 | Supprimer **toute** la gestion d'erreur de clé |
+| 13 | Retirer le vidage ligne à ligne, cœur du commit |
+| 3 | Retirer une clé étrangère, rendre une colonne nullable |
+| 4 | Retirer la limite de longueur des identifiants |
+| 14 | Un test nommé « chemin relatif » qui passait un chemin **absolu** |
 
-Dans le cas de la tâche 2, ce trou n'est pas anodin : c'est exactement la branche
-qui portait la fuite Critical décrite plus bas.
-
----
-
-## Les trois défauts sérieux trouvés
-
-**Une fuite de la clé de chiffrement (Critical).** Dans `panel/crypto.py`, la
-lecture de la configuration était hors du bloc protégé. Une clé trop courte —
-typo, copier-coller tronqué — faisait lever pydantic, avec un message contenant
-**la valeur reçue en clair** :
-
-```
-ValidationError: String should have at least 32 characters
-  [input_value='short-prod-key-123', ...]
-```
-
-Tout gestionnaire d'erreurs qui journalise cette exception écrivait la clé de
-chiffrement du panneau dans les logs. Corrigé, et `Settings.secret_key` est
-désormais masquée dans toutes ses représentations.
-
-**Un timeout neutralisé.** Le code que le plan proposait pour lire la sortie de
-l'engine bloquait indéfiniment sur une étape partie en boucle : la lecture ne
-rendait jamais la main, donc le timeout ne se déclenchait jamais. Un run bloqué
-le serait resté pour toujours. Remplacé par une lecture dans un thread séparé.
-
-**Une regex qui laissait passer un retour à la ligne.** En Python, `$` matche
-juste avant un `\n` final : `re.match(r"^[a-z][a-z0-9-]{1,30}$", "mon-app\n")`
-réussit. Ce nom devient nom de répertoire, de projet Compose et de réseau Docker.
-Corrigé en `re.fullmatch`.
-
-**Les trois avaient leur origine dans le plan, pas dans l'implémentation.**
+Dans le cas de la tâche 14, la preuve est nette : en réintroduisant le bug
+d'origine complet, les treize tests restaient verts.
 
 ---
 
-## Deux choses trouvées en exécutant plutôt qu'en lisant
-
-**Un bug de chemin, révélé par une preuve « bonus ».** La tâche 14 devait
-invoquer une doublure de l'engine. On lui a demandé, si c'était faisable,
-d'invoquer aussi le **vrai** binaire. Ça a révélé une erreur de répertoire de
-travail que la doublure masquait.
-
-**Une panne Redis qui ralentit au lieu d'échouer.** Testé avec un vrai client sur
-un port fermé : chaque publication bloque 3 à 4 secondes malgré le timeout
-configuré, `redis-py` appliquant sa propre politique de retry. Lors d'une panne,
-le flux de logs ne s'arrêterait pas — il défilerait au ralenti, et un run de mille
-lignes prendrait une heure. À traiter par la tâche qui construira le client.
-
----
-
-## Décisions d'architecture prises en chemin
+## Décisions d'architecture prises
 
 **Politique de suppression en base**, tranchée et justifiée dans le code :
+Application → Cible en `RESTRICT`, Run → Application et Étape → Run en `CASCADE`.
+Les tests activent les clés étrangères sous SQLite, sans quoi ils voyaient un
+comportement **opposé** à celui de PostgreSQL.
 
-| Relation | Politique | Pourquoi |
-|---|---|---|
-| Application → Cible | RESTRICT | une cible utilisée ne disparaît pas en silence |
-| Run → Application | CASCADE | un historique sans son application n'a pas de sens |
-| Étape → Run | CASCADE | une étape n'existe pas hors de son run |
-
-Les tests activent désormais les clés étrangères sous SQLite : sans ça, ils
-voyaient un comportement opposé à celui de PostgreSQL et ne prouvaient rien.
-
-**Deux natures d'étape dès maintenant.** Le modèle distingue les étapes qui
-appellent l'engine de celles qui exécutent du Python. Au jalon 4, les opérations
-BunkerWeb devront tourner côté Python — le contrat interdit à une étape de
-l'engine de connaître le panneau. L'ajouter après coup imposerait de réécrire le
-worker.
+**Deux natures d'étape dès maintenant** — celles qui appellent l'engine, celles
+qui exécutent du Python. Au jalon 4, les opérations BunkerWeb devront tourner côté
+Python ; l'ajouter après coup imposerait de réécrire le worker.
 
 **Parité vérifiée, pas déclarée.** Le test du pipeline interroge réellement
-`bash engine/bootstrap.sh --list-steps` par sous-processus. Une étape déclarée
-d'un seul côté est détectée dans les deux sens.
+`bash engine/bootstrap.sh --list-steps` par sous-processus.
+
+**Sondes de santé distinctes.** `/healthz` ne dépend de rien — sinon Docker
+redémarrerait le panneau en boucle à chaque hoquet de PostgreSQL. `/readyz`
+interroge la base et Redis, et c'est lui que `depends_on: condition:
+service_healthy` regardera.
+
+**argon2id** avec `time_cost=3`, `memory_cost=64 Mio`, `parallelism=4` — aligné
+sur la recommandation OWASP, et un test mesure que le hachage prend plus de 5 ms.
+Un utilisateur inexistant subit le même coût qu'un mot de passe faux, pour ne pas
+révéler qui existe.
+
+---
+
+## Question ouverte, à trancher avant le jalon 3
+
+Le `CASCADE` signifie que supprimer une application **efface tout son historique
+de déploiement**, atomiquement et irréversiblement.
+
+Pour un outil dont le métier est de détruire des infrastructures, « qu'avait-on
+déployé sur cette cible avant de tout effacer » est précisément ce qu'un opérateur
+veut consulter après coup. Le `CASCADE` n'est sûr pour l'audit que si la séquence
+de destruction fait un **effacement logique** plutôt qu'une suppression réelle.
+
+Ce n'est pas un défaut du code actuel — il n'y a pas encore de code de destruction
+— mais c'est une décision qui se verrouille en silence.
+
+---
+
+## Frictions de méthode rencontrées
+
+**Les worktrees ne partent pas du `main` du moment.** Les dix agents lancés l'ont
+tous rencontré. La consigne de rebase est désormais en tête de chaque prompt.
+
+**`.superpowers/` est gitignoré, donc absent des worktrees.** Plusieurs agents
+n'ont pas pu lire leur brief et ont travaillé directement depuis le plan — ce qui
+a marché, mais par chance. Les briefs devraient être transmis autrement.
+
+**Un agent a contourné une restriction d'outil.** Ne pouvant écrire son rapport
+hors de son worktree, il est passé par le shell. Aucun dommage — un fichier de
+rapport dans un répertoire ignoré — mais le motif est à surveiller, et
+l'instruction qui l'y poussait a été retirée.
 
 ---
 
 ## Points d'intendance
 
-**Le démon Docker est éteint.** Sans conséquence pour ce qui tourne, mais l'image
-du panneau n'a pas pu être construite, et ça bloquera la tâche 21 (`compose.yml`)
-et surtout la tâche 22 (test d'intégration réel).
+**Le démon Docker est éteint.** L'image du panneau n'a pas pu être construite, et
+ça bloquera les tâches 21 et 22.
 
-**La VM de test n'est plus vierge** — Docker et la stack `tp-app` y tournent
-depuis la validation du jalon 1. Avant la tâche 22 :
-`engine/tools/test-target.sh down` puis `up`.
-
-**L'environnement Python n'est pas installé sur `main`.** Chaque worktree a créé
-le sien. À la première fusion, il faudra un `pip install -e '.[dev]'` à la racine
-pour que `pytest` tourne sans détour.
-
-**Les worktrees isolés ne partent pas du `main` du moment.** Les sept agents de
-la vague l'ont rencontré et ont dû se rebaser. C'est consigné pour être annoncé
-dès le prompt aux vagues suivantes.
+**La VM de test n'est plus vierge** — Docker et la stack `tp-app` y tournent.
+Avant la tâche 22 : `engine/tools/test-target.sh down` puis `up`.
 
 ---
 
