@@ -7,7 +7,7 @@ qui garantit qu'une variable oubliée casse au démarrage, pas au premier run.
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -17,7 +17,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PANEL_", extra="ignore")
 
     # --- Secrets et base ---
-    secret_key: str = Field(min_length=32)
+    # SecretStr : la valeur reste lisible via .get_secret_value(), mais toute
+    # représentation textuelle (repr, str, model_dump, model_dump_json) est
+    # masquée — un log ou une trace génériques n'exposent jamais la clé.
+    secret_key: SecretStr = Field(min_length=32)
     database_url: str = "postgresql+psycopg://panel:panel@postgres:5432/panel"
     redis_url: str = "redis://redis:6379/0"
 
