@@ -1,197 +1,132 @@
-# Bootstrap TP DevSecOps
+# DeployMatic (jalon 1 — engine Docker)
 
-> Déploie une chaîne DevSecOps complète (microservices + Kubernetes + CI/CD + Skills Claude Code) en un clic — interface web ou CLI au choix. Idempotent, paramétrable, modulaire.
+> **Interface web hors service.** L'ancienne UI Flask (`web/`) est cassée
+> depuis que l'orchestrateur a déménagé sous `engine/` — elle ne sera pas
+> réparée, elle sera **remplacée** au jalon 2 par un panneau FastAPI. Pour
+> l'instant, seule la ligne de commande fonctionne.
 
-[![bash](https://img.shields.io/badge/bash-4%2B-blue.svg)](#)
-[![python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#)
+[![bash](https://img.shields.io/badge/bash-3.2%2B-blue.svg)](#)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](#licence)
+
+DeployMatic déploie une application (API + frontend, ou toute autre topologie
+décrite dans un `spec.json`) sur un serveur distant via SSH et Docker Compose,
+avec un pipeline CI/CD GitHub Actions optionnel et des Skills Claude Code
+générées pour la piloter en langage naturel.
+
+Le projet est en cours de transformation : l'ancien script bash monolithique
+sur Kubernetes devient un **engine bash exécuteur d'étapes**, appelé par un
+futur panneau web Python (jalon 2). Ce README décrit **ce qui existe
+aujourd'hui** — la ligne de commande de l'engine. Pour le projet cible sur six
+jalons, voir [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ---
 
 ## Table des matières
 
 - [Démarrage rapide](#démarrage-rapide)
-- [Workspaces (plusieurs projets)](#workspaces-plusieurs-projets)
-- [Interface web (recommandée)](#interface-web-recommandée)
-- [CLI (pour habitués du terminal)](#cli-pour-habitués-du-terminal)
-- [Ce que fait le script](#ce-que-fait-le-script)
+- [Ce que fait l'engine](#ce-que-fait-lengine)
 - [Architecture modulaire](#architecture-modulaire)
-- [Paramètres collectés](#paramètres-collectés)
-- [Sécurité (DevSecOps intégré)](#sécurité-devsecops-intégré)
-- [Robustesse](#robustesse)
+- [Format de configuration](#format-de-configuration)
 - [Skills Claude Code générées](#skills-claude-code-générées)
+- [Sécurité](#sécurité)
 - [Pré-requis](#pré-requis)
-- [Mode non-interactif (CI/CD)](#mode-non-interactif-cicd)
+- [Diagnostic](#diagnostic)
 - [Dépannage](#dépannage)
+- [Documentation complète](#documentation-complète)
 - [Licence](#licence)
 
 ---
 
 ## Démarrage rapide
 
+Il n'y a pas encore de panneau qui écrit `env.json`/`spec.json` à ta place :
+au jalon 1, on les écrit à la main. C'est fastidieux, et c'est temporaire —
+c'est précisément ce que le panel du jalon 2 automatise.
+
 ```bash
-git clone https://github.com/Xavito240/bootstrap-tp.git
-cd bootstrap-tp
+git clone https://github.com/KowKowFR/script-devops.git
+cd script-devops
 
-# Option A — Interface web (le plus simple)
-./web/start.sh
+# 1. Un workspace = un répertoire sous runs/, avec deux fichiers JSON.
+mkdir -p runs/monprojet
+cp engine/templates/spec.demo.json runs/monprojet/spec.json
 
-# Option B — CLI
-./bootstrap.sh
+cat > runs/monprojet/env.json <<'EOF'
+{
+  "app":      { "name": "tp-app", "author": "Ton Nom" },
+  "target":   { "host": "1.2.3.4", "user": "devops", "auth_method": "key",
+                "ssh_key_path": "/chemin/vers/ta_cle", "password": "",
+                "bind_addr": "0.0.0.0" },
+  "registry": { "user": "tondockerhubuser", "token": "dckr_pat_…" },
+  "github":   { "enabled": false, "user": "", "repo": "", "token": "" },
+  "ports":    { "api": 10001, "web": 10002 },
+  "limits":   { "cpu": "200m", "memory": "128Mi" },
+  "options":  { "reuse_existing_dir": true, "allow_existing_repo": true }
+}
+EOF
+chmod 600 runs/monprojet/env.json runs/monprojet/spec.json
+
+# 2. Lister les étapes disponibles.
+bash engine/bootstrap.sh --list-steps
+
+# 3. Exécuter une étape à la fois — c'est le mode d'appel nominal.
+bash engine/bootstrap.sh --workspace monprojet --step validate_ssh
+bash engine/bootstrap.sh --workspace monprojet --step prepare_server
+# … une par une, dans l'ordre de --list-steps.
+
+# Ou, pour tester l'engine seul de bout en bout (jamais utilisé par le panel) :
+bash engine/bootstrap.sh --workspace monprojet --all
 ```
 
-> 💡 Si tu n'es pas à l'aise avec le terminal : **prends l'option A**. Tu n'auras besoin que de ton navigateur après le `./web/start.sh`.
+Chaque appel `--step` écrit ses logs sur **stderr** et imprime **une seule
+ligne JSON** sur **stdout** en fin d'exécution :
+`{"ok":true,"data":{...}}` ou `{"ok":false,"error":"..."}`. C'est le contrat
+que le panel s'appuiera dessus au jalon 2 — voir
+[`docs/ENGINE.md`](docs/ENGINE.md) pour la référence complète.
+
+Pas de cible SSH sous la main ? `engine/tools/test-target.sh up` monte une VM
+Ubuntu locale (via Lima) en une commande — voir
+[`docs/TEST-TARGET.md`](docs/TEST-TARGET.md).
 
 ---
 
-## Workspaces (plusieurs projets)
+## Ce que fait l'engine
 
-Tu peux gérer **plusieurs projets en parallèle** sur la même machine. Chacun a son état isolé sous `runs/<nom>/` (credentials, state, log, projet généré).
-
-### Via la Web UI
-
-La page d'accueil de l'UI liste tous tes workspaces avec leur progression. Tu cliques sur "+ Nouveau workspace", tu choisis un nom, et tu remplis le form pour ce projet précis. Tu peux switcher entre eux à tout moment.
-
-### Via la CLI
-
-```bash
-./bootstrap.sh --list-workspaces                # liste tous les workspaces
-./bootstrap.sh --workspace tp1                  # bootstrap dans le workspace "tp1"
-./bootstrap.sh -w prod --doctor                 # diagnostic sur le workspace "prod"
-./bootstrap.sh --workspace staging --status     # progression du workspace "staging"
-./bootstrap.sh --rm-workspace old-tp            # suppression
-```
-
-Sans `--workspace`, le workspace `default` est utilisé (compatible avec l'ancien comportement).
-
-### Layout sur disque
+`engine/bootstrap.sh --list-steps` est la source de vérité — voici sa sortie
+au moment de la rédaction :
 
 ```
-runs/
-├── default/                          ← workspace par défaut (créé par migration auto)
-│   ├── .bootstrap-env                ← credentials chmod 600
-│   ├── .bootstrap-state              ← étapes déjà accomplies
-│   ├── .bootstrap.log                ← trace horodatée
-│   └── tp-devops-agent-ia/           ← projet généré pour ce workspace
-├── tp1/
-│   └── …
-└── prod/
-    └── …
+check_prereqs
+validate_ssh
+create_project_dir
+generate_microservices
+generate_compose
+generate_skills
+generate_workflow
+enable_sudo_nopasswd
+prepare_server
+build_images
+deploy_stack
+validate_deployment
+github_create_repo
+github_set_secrets
+git_init
+git_push
 ```
 
-> **Migration** : si tu avais un `.bootstrap-env`, `.bootstrap-state` ou un `tp-devops-agent-ia/` à la racine (ancien layout), ils sont automatiquement déplacés dans `runs/default/` au premier lancement.
+C'est aussi l'ordre d'exécution exact de `--all`. Détail étape par étape dans
+[`docs/ENGINE.md`](docs/ENGINE.md#5-les-étapes).
 
----
+En résumé : validation SSH → génération du projet (microservices Express +
+nginx, `compose.yml` durci, Skills, workflow CI) → provisioning du serveur
+(Docker, ufw, fail2ban) → build des images **sur la cible** via
+`DOCKER_HOST=ssh://` → déploiement Compose → validation HTTP locale à la
+cible → bloc GitHub **optionnel** (dépôt, secrets, push).
 
-## Interface web (recommandée)
-
-```bash
-./web/start.sh
-```
-
-Un navigateur s'ouvre automatiquement sur `http://127.0.0.1:5005` avec un formulaire. Remplis, clique, regarde les logs en direct.
-
-### Ce que tu obtiens
-
-| Écran | Description |
-|---|---|
-| **Formulaire** | 5 sections (Identités, Serveur, App, Scaling, Env+TLS). Auth SSH conditionnelle (clé OU mot de passe). Validation côté serveur avec liste claire des champs manquants. |
-| **Progression** | 18 étapes affichées à gauche (cercles vides → coral pulsant → ✓ vert). Logs en direct à droite via Server-Sent Events. Auto-scroll, ANSI codes nettoyés. |
-| **Succès** | Modal avec les liens extraits du log : application live, dépôt GitHub, page CI/CD, endpoint /api/health. |
-
-### Fonctionnalités clés
-
-- **Pré-remplissage automatique** depuis `.bootstrap-env` si le fichier existe (utile pour relancer après modification)
-- **Bouton Reset** : nettoie l'état + credentials (avec confirmation)
-- **Bouton Arrêter** : envoie `SIGTERM` au bootstrap en cours, puis `SIGKILL` si refus
-- **Détection de stale lock** : si le serveur a planté précédemment, le lock file est ignoré au prochain démarrage
-- **Aide sudo NOPASSWD intégrée** : un toggle affiche les 2 commandes à coller sur ton serveur, pré-remplies avec ton username SSH
-
-### Sécurité de l'interface
-
-- **Bind 127.0.0.1 uniquement** — impossible d'y accéder depuis le réseau
-- Aucune authentification (inutile pour un usage local solo)
-- Champs sensibles en `<input type="password">` (masqués à l'écran)
-- Credentials écrits dans `.bootstrap-env` avec **chmod 600** (jamais en transit réseau)
-- Aucun fichier sensible ne quitte ta machine
-
-### Comment ça marche sous le capot
-
-```
-[Browser]  ──form HTML──▶  [Flask local 127.0.0.1:5005]
-   │                              │
-   │                              ├─▶ écrit .bootstrap-env (chmod 600)
-   │                              ├─▶ subprocess: bash bootstrap.sh --config ...
-   │                              │      │
-   │                              │      └─▶ écrit .bootstrap.log + .bootstrap-state
-   │                              │
-   ◀────SSE stream────────────────┤   tail .bootstrap.log
-                                  │   diff .bootstrap-state
-                                  ▼
-                               18 étapes ✓
-```
-
-Stack : Flask (Python 3, ~280 lignes) + HTML/CSS/JS vanilla + SSE (Server-Sent Events). Aucun WebSocket, aucun framework JS, aucune base de données.
-
----
-
-## CLI (pour habitués du terminal)
-
-```bash
-# Première exécution (TUI interactive gum)
-./bootstrap.sh
-
-# Voir ce qui serait fait sans rien exécuter
-./bootstrap.sh --dry-run
-
-# Mode non-interactif (CI/CD ou reproduction de déploiement)
-./bootstrap.sh --config my-deployment.env
-
-# Diagnostic post-déploiement
-./bootstrap.sh --doctor          # SSH + cluster + secrets + pods + HTTP
-./bootstrap.sh --logs api        # tail logs du pod API (Ctrl-C pour sortir)
-./bootstrap.sh --logs web        # idem pour Web
-./bootstrap.sh --cluster-info    # nodes/pods/svc/ingress en une vue
-
-# Lancer Claude Code dans le projet
-./bootstrap.sh claude            # cd tp-devops-agent-ia/ && exec claude
-
-# Maintenance
-./bootstrap.sh --status          # affiche les étapes faites/restantes
-./bootstrap.sh --reset           # efface .bootstrap-state + .bootstrap-env
-./bootstrap.sh --help            # aide complète
-```
-
-Le CLI utilise [gum](https://github.com/charmbracelet/gum) pour une TUI agréable (prompts, menus, spinners, encadrés). Si `gum` n'est pas installé, le script propose l'install automatique. Refus → fallback texte avec `read` classique.
-
----
-
-## Ce que fait le script
-
-`bootstrap.sh` enchaîne **18 étapes idempotentes** : génération du code, provisioning du serveur, création du dépôt GitHub, CI/CD, déploiement K8s et validation HTTP. Que tu lances depuis l'UI web ou la CLI, c'est le même pipeline.
-
-| # | ID d'état | Action |
-|---|---|---|
-| 1 | `prereqs_checked` | Vérifie git, gh, ssh, curl, jq, docker, kubectl, claude, gum |
-| 2 | `credentials_collected` | Collecte des paramètres (TUI gum **ou** formulaire web) |
-| 3 | `ssh_validated` | Test SSH (clé ou mot de passe via sshpass) |
-| 4 | `project_dir_created` | Crée le dossier de travail local |
-| 5 | `microservices_generated` | API Express + Front nginx + Dockerfiles |
-| 6 | `manifests_generated` | Deployments + Services + Ingress (+ ClusterIssuer si TLS) |
-| 7 | `skills_generated` | 5 Skills Claude Code custom |
-| 8 | `workflow_generated` | `.github/workflows/deploy.yml` (gitleaks + trivy intégrés) |
-| 9 | `sudo_nopasswd_enabled` | Configure sudo NOPASSWD côté serveur |
-| 10 | `server_prepared` | Docker, k3s, kubectl, helm, ufw, fail2ban, cert-manager (opt.) |
-| 11 | `kubeconfig_fetched` | Kubeconfig copié + testé localement |
-| 12 | `initial_manifests_applied` | Premier kubectl apply (avant le 1er workflow CI) |
-| 13 | `github_repo_created` | `gh repo create` |
-| 14 | `github_secrets_set` | Upload DOCKERHUB_*, OVH_* (clé SSH OU mot de passe) |
-| 15 | `git_initialized` | git init + remote origin |
-| 16 | `git_pushed` | Push initial → déclenche le workflow |
-| 17 | `first_deploy_triggered` | Suit le workflow avec gum spin (timeout 10 min) |
-| 18 | `deployment_validated` | curl /api/health + frontend |
-
-> Les étapes 5/6/7/8 sont rejouées à chaque run (overwrite idempotent) pour rester en phase avec `.bootstrap-env`. Le `.bootstrap-state` tracke ce qui est "fait" pour les autres.
+Chaque étape se lance indépendamment (`--step <nom>`) et répond par une seule
+ligne JSON. Le détail complet — ce que chaque étape lit dans `env.json`/
+`spec.json`, ce qu'elle renvoie, les codes de sortie — est dans
+[`docs/ENGINE.md`](docs/ENGINE.md).
 
 ---
 
@@ -199,225 +134,162 @@ Le CLI utilise [gum](https://github.com/charmbracelet/gum) pour une TUI agréabl
 
 ```
 bootstrap-tp/
-├── bootstrap.sh              Orchestrateur CLI (PIPELINE déclaratif, ~240 lignes)
-├── lib/                      Modules réutilisables
-│   ├── ui.sh                   gum wrappers + fallback ANSI
-│   ├── state.sh                state_has/mark/show piloté par PIPELINE
-│   ├── config.sh               ALL_VARS = source unique pour save/load/reset
-│   ├── ssh_remote.sh           ssh_remote, ssh_remote_tty, scp_remote
-│   ├── prereqs.sh              ensure_gum, check_prereqs, ensure_sshpass
-│   ├── collect.sh              collect_credentials, confirm_summary
-│   ├── runtime.sh              log_init, acquire_lock, trap d'erreur
-│   ├── diag.sh                 cmd_doctor, cmd_logs, cmd_cluster_info
-│   ├── steps.sh                Fonctions step_* exécutées par le pipeline
-│   ├── gen_microservices.sh    API Express + Front nginx + Dockerfiles
-│   ├── gen_manifests.sh        Deployments, Services, Ingress, ClusterIssuer TLS
-│   ├── gen_workflow.sh         Workflow GitHub Actions (gitleaks + trivy)
-│   ├── gen_skills.sh           Skills Claude Code (5)
-│   └── prepare_server.sh       Provisioning serveur (exécuté via SSH)
-├── web/                      Interface web (Flask + SSE)
-│   ├── app.py                  Backend Flask (~280 lignes)
-│   ├── templates/              index.html (form) + progress.html (live)
-│   ├── static/                 style.css + app.js + progress.js
-│   ├── requirements.txt        Flask uniquement
-│   └── start.sh                Launcher venv + browser auto
-├── tp-devops-agent-ia/       Projet généré (créé par le bootstrap)
-├── .bootstrap-state          État local (gitignoré)
-├── .bootstrap-env            Credentials chmod 600 (gitignoré)
-├── .bootstrap.log            Trace horodatée (gitignoré)
-└── README.md
+├── engine/
+│   ├── bootstrap.sh          Dispatcher : exécute UNE étape nommée
+│   ├── lib/
+│   │   ├── ui.sh                Messages de progression (stderr uniquement)
+│   │   ├── runtime.sh           Contrat de sortie JSON + trap d'erreur
+│   │   ├── config.sh             cfg/cfg_req/cfg_port (env.json), spec_* (spec.json)
+│   │   ├── units.sh               Conversion d'unités Kubernetes → Docker
+│   │   ├── ssh_remote.sh          ssh_remote/scp_remote, DOCKER_HOST=ssh://
+│   │   ├── prereqs.sh             Vérification des outils requis
+│   │   ├── steps.sh                Les 16 fonctions step_*
+│   │   ├── gen_compose.sh          Génère deploy/compose.yml
+│   │   ├── gen_microservices.sh    Génère l'app de démo (API + Web)
+│   │   ├── gen_workflow.sh         Génère .github/workflows/deploy.yml
+│   │   ├── gen_skills.sh           Génère les 5 Skills Claude Code
+│   │   ├── prepare_server.sh       Provisioning serveur (envoyé via SSH)
+│   │   └── diag.sh                 cmd_doctor, cmd_logs, cmd_stack_info
+│   ├── templates/
+│   │   └── spec.demo.json          spec.json de l'app de démo
+│   ├── tools/
+│   │   ├── migrate-env.sh          Migre un ancien .bootstrap-env vers env.json
+│   │   └── test-target.sh          VM Ubuntu locale (Lima) pour tester l'engine
+│   └── tests/                    Suite de tests (bash pur, aucune dépendance)
+├── runs/                       Workspaces (gitignoré) : runs/<ws>/{env,spec}.json
+├── docs/                       Documentation du projet (ce dossier)
+└── web/                        Interface Flask — CASSÉE, ne pas réparer (voir en-tête)
 ```
 
-### Étendre le script
-
-**Ajouter une étape** : une seule ligne au tableau `PIPELINE` de `bootstrap.sh` :
-```bash
-"my_step_id|Mon étape|step_my_function"
-```
-
-**Ajouter une variable** : une seule ligne à `ALL_VARS` dans `lib/config.sh`. Le reste suit (save/load/reset/form web).
-
-**Ajouter un workspace** : `./bootstrap.sh --workspace nouveau` — le dossier est créé à la volée et tu peux le configurer indépendamment du reste.
+`web/`, `bootstrap.sh` et `lib/` à la racine du dépôt sont l'**ancien**
+système Kubernetes ; ils restent sur disque pour l'historique mais ne sont
+plus le point d'entrée. Tout ce qui est actif vit sous `engine/`.
 
 ---
 
-## Paramètres collectés
+## Format de configuration
 
-| Variable | Défaut | Rôle |
-|---|---|---|
-| `GITHUB_USER` | (auto via `gh`) | Owner du repo GitHub |
-| `GITHUB_REPO_NAME` | `tp-devops-agent-ia` | Nom du repo créé |
-| `APP_AUTHOR` | = GITHUB_USER | Affiché dans `/info` de l'API |
-| `DOCKERHUB_USER` | (requis) | Username Docker Hub |
-| `DOCKERHUB_TOKEN` | (requis, masqué) | Token push (scope R/W/D) |
-| `OVH_HOST` | (requis) | IP/hostname du serveur cible |
-| `OVH_USER` | `devops` | Utilisateur SSH |
-| `OVH_AUTH_METHOD` | `key` | `key` (clé SSH) ou `password` (via sshpass) |
-| `OVH_SSH_KEY_PATH` | `~/.ssh/id_ed25519` | Chemin clé privée (mode key) |
-| `OVH_PASSWORD` | — | Mot de passe SSH (mode password, masqué) |
-| `APP_NAME` | `tp-app` | Préfixe images Docker et noms de deployments |
-| `APP_PORT` | `80` | Port HTTP du frontend |
-| `API_PORT` | `3000` | Port HTTP de l'API |
-| `REPLICAS_API` | `2` | Nombre de réplicas API |
-| `REPLICAS_WEB` | `2` | Nombre de réplicas Web |
-| `CPU_LIMIT_API` | `200m` | Limite CPU API |
-| `MEM_LIMIT_API` | `128Mi` | Limite mémoire API |
-| `DEPLOY_ENV` | `dev` | `dev` / `staging` / `prod` |
-| `INGRESS_HOST` | (vide) | Hostname Ingress, vide = match par IP |
-| `ACME_EMAIL` | (vide) | Email Let's Encrypt (TLS auto si défini ET `INGRESS_HOST` défini) |
+Deux fichiers JSON par workspace, **jamais chargés par `source`** — lus avec
+`jq`, ce qui ferme la classe d'injection qu'un `.bootstrap-env` shell
+autorisait (voir [Sécurité](#sécurité)) :
 
-Tout est sauvegardé dans `.bootstrap-env` (chmod 600, gitignoré).
+- **`runs/<ws>/env.json`** — paramètres d'exécution et secrets : cible SSH,
+  identifiants du registre, ports hôtes alloués par service, limites de
+  ressources, bloc GitHub optionnel.
+- **`runs/<ws>/spec.json`** — description de l'application : ses services,
+  chacun avec un `id`, soit `build` (nos sources, durcissement complet) soit
+  `image` (image tierce, durcissement partiel), un `port` conteneur, un
+  `health` optionnel, un `expose` optionnel (chemin public → port hôte
+  publié).
 
----
+Les deux schémas complets, commentés, avec les règles de validation exactes
+(`spec_init` rejette par exemple tout id de service hors
+`[A-Za-z0-9_-]+`), sont dans [`docs/ENGINE.md`](docs/ENGINE.md#2-entrées).
 
-## Sécurité (DevSecOps intégré)
-
-Le workflow CI/CD généré inclut une chaîne de sécurité **bloquante** :
-
-| Étape | Outil | Effet |
-|---|---|---|
-| Scan secrets | `gitleaks-action@v2` | Bloque le build si un secret est leaké dans git |
-| Scan image API | `trivy-action@v0.36.0` | Bloque le deploy sur vulns HIGH/CRITICAL |
-| Scan image Web | `trivy-action@v0.36.0` | Idem pour le frontend |
-| TLS auto | `cert-manager` + Let's Encrypt | Provisioning HTTPS (HTTP-01) si `INGRESS_HOST` + `ACME_EMAIL` |
-
-Le serveur déployé est aussi sécurisé automatiquement :
-- **ufw** : deny incoming par défaut, n'autorise que 22, 80, 443, 6443
-- **fail2ban** : protection brute-force SSH
-- **sudo NOPASSWD** ciblé sur l'utilisateur de déploiement (pas un blanc-seing root)
-
-Les pods utilisent un security context strict :
-- `runAsNonRoot: true`, `runAsUser: 1000`
-- `allowPrivilegeEscalation: false`
-- `capabilities.drop: ["ALL"]`
-
-Côté local :
-- `.bootstrap-env` chmod 600, jamais committé
-- Token Docker Hub masqué à la saisie (CLI + Web)
-- Clé SSH validée AVANT upload côté CI (rejet des clés à passphrase qui casseraient le runner)
-
----
-
-## Robustesse
-
-- **Idempotence** via `.bootstrap-state` (relance = reprise propre)
-- **Lock file** `.bootstrap.lock` : empêche deux exécutions simultanées (détecte les stale locks via PID)
-- **Trap d'erreur global** : en cas de crash, affiche l'étape en cours, la ligne, la commande, et le chemin du log
-- **Logging fichier** `.bootstrap.log` horodaté (auto en mode non-interactif / Web UI ; opt-in via `BOOTSTRAP_LOG=1` en CLI interactif)
-- **`--dry-run`** : liste les étapes qui seraient exécutées sans rien faire
-- **Reprise après crash** : il suffit de relancer `./bootstrap.sh` (ou `./web/start.sh`), les étapes déjà ✓ sont skip
-- **Re-exec automatique sous bash** : si lancé via `sh` ou `bash --posix`, le script se relance proprement
+`runs/` doit être en `700`, les deux fichiers JSON en `600`.
 
 ---
 
 ## Skills Claude Code générées
 
-Le bootstrap génère **5 Skills custom** dans `.agents/skills/` du projet généré :
+Chaque projet déployé reçoit **5 Skills** dans `.agents/skills/` (et un
+symlink `.claude/skills/` pour la compatibilité Claude Code) :
 
 | Skill | Rôle |
 |---|---|
-| `microservice-editor` | Modifie le code de l'API (Express) ou du Front (HTML) en suivant les conventions |
-| `github-flow` | Commits conventionnels + push sur main |
-| `k8s-deploy` | Déploie une nouvelle version via GitOps (bump version → push → CI/CD) |
-| `health-monitor` | Vérifie la santé post-deploy, **rollback automatique** si échec |
-| `rollback-manager` | Rollback **manuel** ciblé (par revision number ou SHA git) |
+| `microservice-editor` | Modifie le code de l'API (Express) ou du Front (HTML) en suivant les conventions du projet |
+| `github-flow` | Commits conventionnels + push sur `main` (si le bloc GitHub est activé) |
+| `docker-deploy` | Déploie une nouvelle version via `DOCKER_HOST=ssh://` + `docker compose up -d` |
+| `health-monitor` | Vérifie la santé post-déploiement |
+| `rollback-manager` | Rollback ciblé en réécrivant `IMAGE_TAG` dans `deploy/.env` (les 5 derniers tags sont conservés dans `deploy/.image-history`) |
 
-Après bootstrap :
 ```bash
-./bootstrap.sh claude
+cd runs/<ws>/<app.name>
+claude
 > "Ajoute une route /stats à l'API, déploie, vérifie la santé"
 ```
 
-Claude détecte les Skills, les enchaîne, et te ramène un déploiement live en ~3 minutes.
+---
+
+## Sécurité
+
+Résumé — le détail complet, avec ce qui est en place, prévu, ou un écart
+documenté, est dans [`docs/SECURITY.md`](docs/SECURITY.md).
+
+- **Plus de `source` de configuration.** L'ancien `.bootstrap-env` shell
+  s'exécutait au chargement (`$(...)` s'évaluait) ; `env.json`/`spec.json`
+  sont lus avec `jq --arg`, qui ne traverse jamais l'évaluateur du shell.
+- **Le socket Docker n'est jamais monté.** L'engine pilote Docker à distance
+  par `DOCKER_HOST=ssh://user@host`, y compris pour un hôte local — un seul
+  chemin de code, aucune exception. Monter `/var/run/docker.sock` donnerait
+  l'équivalent de `root` sur l'hôte à quiconque contrôle le conteneur.
+- **Durcissement des conteneurs, en deux niveaux.** Les services **buildés**
+  (nos sources, clé `build` du spec) reçoivent le durcissement complet :
+  utilisateur non-root (UID 1000), système de fichiers en lecture seule,
+  toutes les capabilities Linux retirées, `no-new-privileges`. Les services
+  sur **image tierce** (clé `image`) ne reçoivent que `no-new-privileges` :
+  forcer l'UID et le read-only sur une image dont on ne maîtrise pas le
+  Dockerfile la casse en général (exemple concret :
+  `postgres:16-alpine` tourne en UID 70 et doit posséder son datadir en
+  écriture). Ce n'est pas un oubli, c'est un arbitrage documenté dans
+  [`docs/SECURITY.md`](docs/SECURITY.md#3--durcissement-des-conteneurs-applicatifs).
+- **Un port hôte doit être ≥ 1024.** Les conteneurs buildés tournent en UID
+  1000, qui ne peut pas binder un port privilégié ; `cfg_port` refuse tout ce
+  qui est hors de `[1024, 65535]` avec un code 2.
+- **Le token du registre ne transite jamais par la ligne de commande SSH** —
+  il est envoyé sur stdin, jamais en argument (visible dans `ps` sinon).
+- **Validation du nom de workspace.** `--workspace` devient un nom de
+  répertoire ; une regex stricte ferme `--workspace ../../etc`.
 
 ---
 
 ## Pré-requis
 
-### Pour la Web UI (le plus simple)
-
-- **Python 3.9+** (le `start.sh` crée un venv et installe Flask tout seul)
-- Un navigateur
+### Poste local (celui qui lance `engine/bootstrap.sh`)
 
 ```bash
 # macOS
-python3 --version    # devrait sortir 3.9 ou plus
+brew install git jq
 
 # Ubuntu / Debian
-sudo apt install python3 python3-venv
+sudo apt install git jq curl ssh
 ```
 
-### Pour la CLI
+Optionnels selon le bloc utilisé :
 
-```bash
-# macOS
-brew install git gh jq gum
-# bash 4+ recommandé : brew install bash (le bash 3.2 macOS marche aussi)
-
-# Ubuntu / Debian
-sudo apt install git gh jq curl
-# gum : https://github.com/charmbracelet/gum#installation
-```
-
-> Si `gum` n'est pas installé, le CLI propose l'install auto (brew/apt). Refus → fallback texte (prompts `read` classiques).
-
-### Optionnels (CLI + Web)
-
-```bash
-brew install docker kubectl       # ou apt équivalents
-# claude : https://docs.claude.com/claude-code
-```
+- `gh` (CLI GitHub) — seulement si `github.enabled: true`.
+- `sshpass` — seulement si `target.auth_method: "password"`.
+- `docker` + plugin `compose` — l'engine pilote la cible à distance, mais
+  `check_prereqs` vérifie leur présence locale (le worker du jalon 2 les
+  embarquera dans son image).
 
 ### Serveur cible
 
-- Ubuntu 22.04+ (ou Debian 12+)
-- Un utilisateur avec sudo (par défaut `devops`)
-- Accès SSH par **clé OU mot de passe** (le script choisit selon `OVH_AUTH_METHOD`)
-- **`sudo NOPASSWD` configuré** pour l'utilisateur SSH (le script propose la commande à coller si manquant)
-- Ports ouverts : 22, 80, 443, 6443 (le script configure ufw automatiquement)
+- Ubuntu 22.04+ (ou Debian 12+), un utilisateur avec sudo (`devops` par
+  défaut).
+- Accès SSH par **clé OU mot de passe**.
+- `sudo NOPASSWD` configuré pour l'utilisateur SSH — l'étape
+  `enable_sudo_nopasswd` détecte l'absence et affiche la commande à coller.
+- Rien d'autre : `prepare_server` installe Docker CE, le plugin Compose, ufw
+  et fail2ban tout seul sur une machine vierge.
+
+Pas de serveur sous la main ? `engine/tools/test-target.sh up` fournit une VM
+Ubuntu locale reproductible — voir [`docs/TEST-TARGET.md`](docs/TEST-TARGET.md).
 
 ---
 
-## Mode non-interactif (CI/CD)
+## Diagnostic
 
-Pour reproduire un déploiement en CI/CD ou scripter :
-
-```bash
-./bootstrap.sh --config my-deployment.env
-```
-
-Format `VAR=value` du fichier `.env` :
-
-```bash
-GITHUB_USER="myuser"
-GITHUB_REPO_NAME="my-app"
-APP_AUTHOR="My Name"
-DOCKERHUB_USER="myuser"
-DOCKERHUB_TOKEN="dckr_pat_..."
-OVH_HOST="1.2.3.4"
-OVH_USER="devops"
-OVH_AUTH_METHOD="key"               # ou "password"
-OVH_SSH_KEY_PATH="/home/user/.ssh/id_ed25519"
-# OVH_PASSWORD="..."                # si OVH_AUTH_METHOD=password
-APP_NAME="my-app"
-APP_PORT="80"
-API_PORT="3000"
-REPLICAS_API="3"
-REPLICAS_WEB="2"
-CPU_LIMIT_API="500m"
-MEM_LIMIT_API="256Mi"
-DEPLOY_ENV="prod"
-INGRESS_HOST="my-app.example.com"   # hostname public, vide = match par IP
-ACME_EMAIL="me@example.com"         # active TLS auto si INGRESS_HOST défini
-```
-
-### Variables d'environnement utiles
-
-| Variable | Effet |
-|---|---|
-| `BOOTSTRAP_NONINTERACTIVE=1` | Active le mode non-interactif (auto si `--config` passé) |
-| `BOOTSTRAP_LOG=1` | Force le `.bootstrap.log` même en CLI interactif (TUI gum dégradée) |
-| `PORT=8080 ./web/start.sh` | Change le port d'écoute de l'interface web (défaut : 5005) |
+`engine/lib/diag.sh` fournit trois fonctions de développement — `cmd_doctor`
+(contrôle outils locaux + SSH + démon Docker distant + `compose.yml` +
+conteneurs + endpoints), `cmd_logs` (`docker compose logs -f`) et
+`cmd_stack_info` (état de la stack). Elles écrivent sur stderr et ne
+respectent pas le contrat JSON du §[Ce que fait l'engine](#ce-que-fait-lengine)
+— ce ne sont **pas** des étapes, et il n'existe **pas encore** de sous-commande
+`bootstrap.sh` pour les invoquer (le dispatcher n'accepte que `--step`,
+`--all`, `--list-steps`, `--dry-run`, `--help`). Elles servent au
+développement de l'engine lui-même ; le panel du jalon 2 les remplacera par
+de vraies vues.
 
 ---
 
@@ -425,46 +297,40 @@ ACME_EMAIL="me@example.com"         # active TLS auto si INGRESS_HOST défini
 
 | Problème | Solution |
 |---|---|
-| **CLI** : `gh: command not found` | `brew install gh` ou `sudo apt install gh` |
-| **CLI** : `gum: command not found` | Le script propose l'install auto ; sinon https://github.com/charmbracelet/gum |
-| **CLI** : `syntax error near unexpected token '>'` | Tu as lancé via `sh` ; le script se re-exec sous bash automatiquement maintenant |
-| **CLI** : `tmp: unbound variable` | (corrigé) bug `trap RETURN` qui leakait — relance simplement |
-| **Web** : `python3: command not found` | Installe Python 3 : `brew install python3` ou `sudo apt install python3 python3-venv` |
-| **Web** : port 5005 déjà utilisé | `PORT=8080 ./web/start.sh` (ou tout autre port libre) |
-| **Web** : page blanche / SSE déconnecté | Recharge la page ; le client `EventSource` resync via `/state` |
-| SSH : `Permission denied (publickey)` | Ta clé publique doit être dans `~/.ssh/authorized_keys` du serveur, ou bascule sur `OVH_AUTH_METHOD=password` |
-| Workflow échoué sur gitleaks | Un secret est dans ton historique git, le retirer (`git filter-repo` ou `BFG`) |
-| Workflow échoué sur trivy | Image trop vulnérable (HIGH+CRITICAL) ; mettre à jour la base ou relâcher `severity: CRITICAL` dans `lib/gen_workflow.sh` |
-| Pods en `ImagePullBackOff` | Token Docker Hub manque la permission Read/Write/Delete |
-| `kubectl: connection refused` | Port 6443 fermé ; vérifier ufw côté serveur |
-| `deployment X not found` au `set image` | Le step "Apply manifests" du workflow n'a pas tourné, voir ses logs |
-| Lock file stale après crash | `rm .bootstrap.lock` puis relance |
+| `--workspace <nom>` refusé | Le nom doit matcher `^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$` — pas de `/`, pas de `..`, pas de préfixe `-` |
+| `paramètre requis manquant dans env.json : ...` | Un champ `cfg_req` est absent ou vide — voir le schéma dans [`docs/ENGINE.md`](docs/ENGINE.md#21-schéma-envjson) |
+| `port hôte hors plage pour '<id>'` | Un port dans `env.json .ports` doit être dans `[1024, 65535]` |
+| `sudo NOPASSWD requis pour ...` | Colle la commande affichée par l'étape sur le serveur, en root |
+| `Permission denied (publickey)` sur `build_images`/`deploy_stack` alors que `validate_ssh` a réussi | Piège connu de `DOCKER_HOST=ssh://` : le CLI `docker` ne sait pas passer `-i`, il faut soit un `ssh-agent` avec la clé chargée, soit un alias `~/.ssh/config` avec `IdentityFile` qui matche `target.host` — détail dans [`docs/ENGINE.md`](docs/ENGINE.md#6-docker_hostssh--ce-qui-a-été-vérifié-en-conditions-réelles) |
+| `services non sains : ...` juste après un déploiement | Souvent transitoire : le healthcheck met jusqu'à ~50 s à passer `starting` → `healthy`. C'est un échec **réessayable** (code 1) — relancer l'étape après quelques secondes |
+| `docker compose config --quiet` échoue sur `deploy/compose.yml` | Le fichier généré est invalide — relancer `--step generate_compose` et lire le message d'erreur `jq`/Compose |
+| `outils manquants : ...` (`check_prereqs`) | Installer ce qui manque ; `docker-compose-plugin` est un plugin, pas un binaire du PATH — `docker compose version` doit fonctionner |
+| Interface web ne démarre pas / erreurs Flask | Normal, voir l'encadré en tête de ce README — `web/` est cassé jusqu'au jalon 2, ne pas le réparer |
 
-### Changer un paramètre après bootstrap
+---
 
-```bash
-# Option A — via Web UI : relance start.sh, modifie le formulaire (pré-rempli)
-./web/start.sh
+## Documentation complète
 
-# Option B — via CLI
-nano .bootstrap-env              # édite manuellement
-./bootstrap.sh                   # les étapes "génération" rejouent toujours
-
-# Puis push les nouveaux manifests/workflow
-cd tp-devops-agent-ia
-git add k8s/ .github/ microservices/
-git commit -m "chore: update bootstrap parameters"
-git push
-```
-
-Le CI réapplique automatiquement les manifests et fait le rolling update.
+- [`docs/ENGINE.md`](docs/ENGINE.md) — référence complète du contrat de
+  l'engine : invocation, schémas `env.json`/`spec.json`, sorties, codes de
+  sortie, chaque étape en détail, ce que l'engine ne fait pas.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — architecture cible sur six
+  jalons (panel Python, worker, BunkerWeb) et ce qui existe déjà.
+- [`docs/SECURITY.md`](docs/SECURITY.md) — modèle de menace complet.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — les six jalons.
+- [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md) — état factuel daté du
+  jalon 1.
+- [`docs/JALON-1-VERIFICATION.md`](docs/JALON-1-VERIFICATION.md) — état de
+  vérification des sept critères d'acceptation du jalon 1.
+- [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) — règles de développement
+  (bash 3.2, invariant stdout, convention « step pure »).
+- [`docs/TEST-TARGET.md`](docs/TEST-TARGET.md) — VM Ubuntu locale pour tester
+  l'engine sans serveur réel.
+- [`docs/TEAM-SPLIT.md`](docs/TEAM-SPLIT.md) — répartition entre les rôles du
+  projet.
 
 ---
 
 ## Licence
 
 MIT.
-
----
-
-<sub>Bootstrap TP DevSecOps — chaîne IA-pilotée avec Claude Code.</sub>
