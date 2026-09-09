@@ -268,7 +268,7 @@ jobs:
   # code web, ou deploy/** — l'équivalent Compose des anciens manifests k8s).
   # Sans cette condition, un push documentation-only réécrirait quand même
   # IMAGE_TAG avec un SHA sous lequel aucune image n'a été poussée : le
-  # `pull` échouerait à coup sûr, un job rouge à chaque commit de doc.
+  # 'pull' échouerait à coup sûr, un job rouge à chaque commit de doc.
   deploy:
     needs: [detect-changes, scan-secrets, build-and-push-api, build-and-push-web]
     if: |
