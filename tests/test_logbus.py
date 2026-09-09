@@ -110,6 +110,61 @@ def test_une_panne_redis_est_journalisee_une_seule_fois_par_run(tmp_path, caplog
     )
 
 
+def test_une_panne_puis_un_retablissement_puis_une_nouvelle_panne_reveillent_lavertissement(tmp_path, caplog):
+    """« Une fois par incident », pas « une fois par instance » : le drapeau
+    anti-répétition doit se réarmer dès qu'une publication réussit. Sinon une
+    panne courte (30 s, Redis redémarre) suivie bien plus tard d'une panne
+    longue — celle qui compte vraiment — resterait invisible dans le même run,
+    puisque le premier avertissement aurait déjà « consommé » le drapeau pour
+    toujours. Séquence exacte : échec, succès, échec → deux avertissements
+    distincts, chacun portant le run_id."""
+    class RedisIntermittent:
+        def __init__(self):
+            self._appels = 0
+
+        def publish(self, *a, **k):
+            self._appels += 1
+            if self._appels == 2:
+                return 1  # ce coup-ci seulement, la publication réussit
+            raise ConnectionError("redis down")
+
+    chemin = tmp_path / "run.log"
+    with caplog.at_level(logging.WARNING, logger="panel.worker.logbus"):
+        with LogBus(RedisIntermittent(), run_id=55, log_path=chemin) as bus:
+            bus.emit_log("etape", "échec")       # panne n°1 → avertissement
+            bus.emit_log("etape", "succès")       # publication OK → drapeau réarmé
+            bus.emit_log("etape", "échec encore")  # panne n°2, distincte → avertissement
+
+    avertissements = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(avertissements) == 2, (
+        f"attendu deux avertissements (un par incident), obtenu {len(avertissements)}"
+    )
+    assert all("55" in r.getMessage() for r in avertissements), (
+        "chaque avertissement doit porter le run_id, pour distinguer les runs dans les logs du worker"
+    )
+
+
+def test_close_ferme_reellement_le_descripteur_de_fichier(tmp_path):
+    """Un worker enchaîne des centaines de runs sans redémarrer : une
+    fermeture cassée est une fuite de descripteurs de fichiers SILENCIEUSE
+    (aucune exception, `close()` avale tout), qui ne se manifeste en
+    production qu'après des heures, sous la forme d'un `Too many open files`
+    très loin de sa cause réelle.
+
+    On vérifie donc que `close()` ferme vraiment le fichier sous-jacent — pas
+    seulement qu'aucune exception n'en sort. `bus._fichier` est un détail
+    d'implémentation qu'on lit directement ici : c'est le seul moyen simple,
+    sans dépendance supplémentaire (psutil…), d'observer l'état réel du
+    descripteur plutôt que de faire confiance à l'absence d'exception."""
+    chemin = tmp_path / "run.log"
+    bus = LogBus(fakeredis.FakeStrictRedis(), run_id=1, log_path=chemin)
+    bus.emit_log("etape", "une ligne")
+    assert not bus._fichier.closed, "le fichier doit être ouvert pendant le run"
+
+    bus.close()
+    assert bus._fichier.closed, "close() doit réellement fermer le descripteur de fichier"
+
+
 def test_le_fichier_est_cree_avec_ses_parents(tmp_path):
     chemin = tmp_path / "logs" / "sous" / "run.log"
     with LogBus(fakeredis.FakeStrictRedis(), run_id=1, log_path=chemin) as bus:

@@ -94,9 +94,9 @@ class LogBus:
             #
             # Mais avaler ne veut pas dire faire disparaître : sans trace, une
             # panne Redis est invisible en production (l'affichage live meurt,
-            # rien ne le signale). On journalise donc — une seule fois par run,
-            # pas une fois par ligne, pour ne pas noyer les logs si Redis reste
-            # indisponible pendant des milliers de lignes.
+            # rien ne le signale). On journalise donc — une seule fois par
+            # INCIDENT (pas une fois par ligne), pour ne pas noyer les logs
+            # pendant une panne qui dure des milliers de lignes.
             if not self._panne_redis_signalee:
                 self._panne_redis_signalee = True
                 logger.warning(
@@ -105,6 +105,14 @@ class LogBus:
                     self._run_id,
                     exc,
                 )
+        else:
+            # Publication réussie : on réarme le drapeau. Sans ça, une panne
+            # courte (30 s, Redis redémarre) suivie bien plus tard d'une panne
+            # longue dans le MÊME run ne produirait jamais de second
+            # avertissement — alors que c'est justement la seconde panne,
+            # celle qui dure, qui intéresse un opérateur. « Une fois par
+            # incident », pas « une fois par instance ».
+            self._panne_redis_signalee = False
 
     def close(self) -> None:
         """Ferme le fichier. Ne lève jamais — appelée aussi depuis `__exit__`
