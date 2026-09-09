@@ -12,10 +12,13 @@ chaque appel à `emit_log`/`emit_event` écrit et publie immédiatement, pour qu
 l'utilisateur voie les logs défiler en direct plutôt qu'un bloc à la fin.
 """
 import json
+import logging
 import re
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Séquences CSI, OSC et codes à un caractère. Volontairement large : mieux vaut
 # retirer une séquence exotique que la voir s'afficher telle quelle dans l'UI.
@@ -29,8 +32,17 @@ def strip_ansi(ligne: str) -> str:
 
 def canal(run_id: int) -> str:
     """Nom du canal Redis pub/sub dédié à un run — un canal par run, jamais partagé,
-    pour que deux runs simultanés ne mélangent jamais leurs flux de logs."""
-    return f"run:{run_id}:logs"
+    pour que deux runs simultanés ne mélangent jamais leurs flux de logs.
+
+    `int(run_id)` assainit volontairement l'entrée : `SUBSCRIBE` fait un match
+    exact (contrairement à `PSUBSCRIBE`), donc un run_id contenant `*`/`?`/`:`
+    n'est pas exploitable aujourd'hui — mais si un futur consommateur bascule
+    sur du pattern-matching, un identifiant non numérique pourrait fabriquer un
+    joker et faire fuiter les logs d'un run vers un autre. Autant fermer la
+    porte ici : un run_id qui n'est pas un entier propre lève franchement,
+    plutôt que de produire un canal surprenant.
+    """
+    return f"run:{int(run_id)}:logs"
 
 
 class LogBus:
@@ -44,7 +56,12 @@ class LogBus:
 
     def __init__(self, redis: Any, run_id: int, log_path: Path) -> None:
         self._redis = redis
+        self._run_id = run_id
         self._canal = canal(run_id)
+        # Une seule alerte par instance : si Redis tombe au milieu d'un run de
+        # plusieurs milliers de lignes, on ne veut pas un warning par ligne —
+        # juste savoir, une fois, que l'affichage temps réel est mort.
+        self._panne_redis_signalee = False
         log_path.parent.mkdir(parents=True, exist_ok=True)
         # buffering=1 : ligne à ligne, pas de tampon qui retarderait l'écriture
         # jusqu'à la fin du run — cohérent avec l'objectif de flux continu.
@@ -66,13 +83,28 @@ class LogBus:
         message["ts"] = time.time()
         try:
             self._redis.publish(self._canal, json.dumps(message, ensure_ascii=False))
-        except Exception:
+        except Exception as exc:
             # Une panne de Redis dégrade l'affichage temps réel ; elle ne doit
             # jamais faire échouer un déploiement en cours. Le fichier reste la
             # source de vérité — on avale volontairement toute exception ici,
-            # y compris au-delà de ConnectionError (Redis peut aussi refuser
-            # l'écriture pour d'autres raisons : mémoire pleine, ACL, etc.).
-            pass
+            # `Exception` large et pas seulement `ConnectionError` : Redis peut
+            # aussi refuser la publication pour d'autres raisons (timeout,
+            # mémoire pleine, ACL, erreur de sérialisation…) et aucune de ces
+            # causes ne doit faire échouer le run.
+            #
+            # Mais avaler ne veut pas dire faire disparaître : sans trace, une
+            # panne Redis est invisible en production (l'affichage live meurt,
+            # rien ne le signale). On journalise donc — une seule fois par run,
+            # pas une fois par ligne, pour ne pas noyer les logs si Redis reste
+            # indisponible pendant des milliers de lignes.
+            if not self._panne_redis_signalee:
+                self._panne_redis_signalee = True
+                logger.warning(
+                    "run %s : publication Redis indisponible (%s), "
+                    "l'affichage temps réel est dégradé — le fichier de log reste la source de vérité",
+                    self._run_id,
+                    exc,
+                )
 
     def close(self) -> None:
         """Ferme le fichier. Ne lève jamais — appelée aussi depuis `__exit__`

@@ -1,5 +1,6 @@
 """Journal : nettoyage ANSI, écriture fichier, publication Redis."""
 import json
+import logging
 
 import fakeredis
 
@@ -47,6 +48,66 @@ def test_une_panne_redis_ninterrompt_pas_le_run(tmp_path, monkeypatch):
     with LogBus(RedisCasse(), run_id=7, log_path=chemin) as bus:
         bus.emit_log("etape", "une ligne")
     assert "une ligne" in chemin.read_text()
+
+
+def test_chaque_ligne_est_visible_au_fichier_pendant_le_run_pas_seulement_a_la_fin(tmp_path):
+    """Le point qui compte pour l'engine : `prepare_server` peut tourner plusieurs
+    minutes, donc le fichier ne doit PAS attendre le vidage final du buffer
+    (fermeture du fichier / fin du `with`) pour contenir les lignes déjà
+    émises. On relit `chemin` DEPUIS L'INTÉRIEUR du bloc, entre deux emit_log,
+    ce qu'aucun autre test ne fait — un test qui relit seulement après la
+    fermeture ne distinguerait pas un flux ligne à ligne d'un flux bufferisé
+    jusqu'à la fin."""
+    r = fakeredis.FakeStrictRedis()
+    chemin = tmp_path / "run.log"
+    with LogBus(r, run_id=11, log_path=chemin) as bus:
+        bus.emit_log("etape", "première ligne")
+        # Le `with` n'est pas encore sorti, `close()` n'a pas été appelé : si
+        # le fichier ne rendait ses écritures qu'à la fermeture, cette lecture
+        # verrait un fichier vide.
+        assert "première ligne" in chemin.read_text()
+
+        bus.emit_log("etape", "deuxième ligne")
+        contenu = chemin.read_text()
+        assert "première ligne" in contenu
+        assert "deuxième ligne" in contenu
+
+
+def test_une_panne_redis_dun_autre_type_ninterrompt_pas_le_run(tmp_path):
+    """`except Exception` doit intercepter N'IMPORTE QUELLE panne de publication,
+    pas seulement `ConnectionError` (déjà couvert par le test précédent). On
+    utilise ici un type totalement différent (TimeoutError) pour ne pas laisser
+    passer un `except ConnectionError` trop étroit."""
+    class RedisCasseAutrement:
+        def publish(self, *a, **k):
+            raise TimeoutError("le serveur Redis ne répond pas")
+
+    chemin = tmp_path / "run.log"
+    with LogBus(RedisCasseAutrement(), run_id=7, log_path=chemin) as bus:
+        bus.emit_log("etape", "une ligne malgré un TimeoutError")
+    assert "une ligne malgré un TimeoutError" in chemin.read_text()
+
+
+def test_une_panne_redis_est_journalisee_une_seule_fois_par_run(tmp_path, caplog):
+    """La panne ne doit pas être totalement silencieuse (sinon personne ne sait
+    que l'affichage temps réel est mort) — mais elle ne doit pas non plus
+    produire un avertissement par ligne : sur un run de plusieurs milliers de
+    lignes avec Redis indisponible, ce serait des milliers d'entrées
+    identiques dans les logs du worker."""
+    class RedisCasse:
+        def publish(self, *a, **k):
+            raise ConnectionError("redis down")
+
+    chemin = tmp_path / "run.log"
+    with caplog.at_level(logging.WARNING, logger="panel.worker.logbus"):
+        with LogBus(RedisCasse(), run_id=7, log_path=chemin) as bus:
+            for i in range(5):
+                bus.emit_log("etape", f"ligne {i}")
+
+    avertissements = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(avertissements) == 1, (
+        f"attendu un seul avertissement pour 5 lignes en échec, obtenu {len(avertissements)}"
+    )
 
 
 def test_le_fichier_est_cree_avec_ses_parents(tmp_path):
