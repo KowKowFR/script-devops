@@ -106,7 +106,17 @@ assert_contains "$deploy_if_block" "needs.detect-changes.outputs.web == 'true'" 
   "mode clé : le déploiement se déclenche si le web a changé"
 assert_contains "$deploy_if_block" "needs.detect-changes.outputs.deploy == 'true'" \
   "mode clé : le déploiement se déclenche aussi si deploy/** a changé (compose.yml, .env.example…)"
-assert_contains "$body_key" $'deploy:\n              - \'deploy/**\'' \
+# Deux assertions mono-ligne plutôt qu'un motif multi-lignes : grep -F
+# traite un motif contenant un retour à la ligne comme plusieurs motifs
+# alternatifs (un OU), jamais une sous-chaîne contiguë (POSIX) — une seule
+# assertion avec $'deploy:\n              - \'deploy/**\'' resterait verte
+# même si le filtre 'deploy' disparaissait entièrement du paths-filter,
+# tant que le JOB deploy: (à 2 espaces) matche encore la partie "deploy:"
+# du motif. assert_contains/assert_not_contains refusent maintenant ce
+# genre de motif (helpers.sh) ; ceci est le correctif de fond.
+assert_contains "$body_key" "            deploy:" \
+  "mode clé : le paths-filter déclare bien une catégorie 'deploy'"
+assert_contains "$body_key" "              - 'deploy/**'" \
   "mode clé : le filtre paths-filter 'deploy' surveille bien deploy/**"
 
 # Le contrôle de santé cible 127.0.0.1 (jamais une URL publique), construit

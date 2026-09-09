@@ -28,8 +28,36 @@ assert_eq() {
   fi
 }
 
+
+# _assert_reject_multiline_pattern MOTIF MESSAGE — code 0 (et un FAIL déjà
+# émis) si MOTIF contient un retour à la ligne littéral, 1 sinon.
+#
+# Piège POSIX vérifié sur cette machine : `grep -F` avec un motif
+# multi-lignes ne cherche PAS une sous-chaîne contiguë — il traite chaque
+# ligne du motif comme une alternative séparée (un OU). Un motif
+# `$'a\nb'` matche donc tout texte contenant SOIT "a" SOIT "b", jamais "a"
+# suivi de "b". Une assertion écrite ainsi peut rester verte alors que le
+# texte qu'elle est censée protéger a disparu — exactement le défaut que ce
+# harnais doit détecter, pas reproduire. D'où ce refus bruyant : mieux vaut
+# un FAIL explicite qui dit pourquoi qu'un faux vert silencieux.
+_assert_reject_multiline_pattern() {
+  case "$1" in
+    *$'\n'*)
+      _t_fail "$2" \
+        "motif invalide : contient un retour à la ligne" \
+        "grep -F traite un motif multi-lignes comme plusieurs motifs" \
+        "alternatifs (un OU), jamais une sous-chaîne contiguë (POSIX) —" \
+        "l'assertion resterait verte même si le texte visé disparaissait." \
+        "Découpe en plusieurs assert_contains/assert_not_contains mono-ligne."
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 assert_contains() {
   # assert_contains TEXTE MOTIF MESSAGE
+  _assert_reject_multiline_pattern "$2" "$3" && return
   if printf '%s' "$1" | grep -qF -- "$2"; then
     _t_ok "$3"
   else
@@ -38,6 +66,7 @@ assert_contains() {
 }
 
 assert_not_contains() {
+  _assert_reject_multiline_pattern "$2" "$3" && return
   if printf '%s' "$1" | grep -qF -- "$2"; then
     _t_fail "$3" "motif présent alors qu'il ne devrait pas : [$2]"
   else
