@@ -9,7 +9,7 @@ il stocke une donnée opaque).
 import base64
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -21,9 +21,18 @@ def _faux_chiffre(clair: str) -> str:
     return base64.urlsafe_b64encode(clair.encode()).decode()
 
 
+def _activer_cles_etrangeres(dbapi_connection, _connection_record):
+    """SQLite n'applique PAS les clés étrangères par défaut (contrairement à
+    PostgreSQL, où NO ACTION/RESTRICT est toujours vérifié). Sans ce PRAGMA,
+    un test de suppression vert ne prouverait rien : la contrainte serait
+    silencieusement absente en test alors qu'elle existe en production."""
+    dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+
 @pytest.fixture
 def session():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    event.listen(engine, "connect", _activer_cles_etrangeres)
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         yield s
@@ -117,3 +126,109 @@ def test_utilisateur_cree_et_relu(session):
     relu = session.exec(select(User).where(User.username == "alex")).one()
     assert relu.password_hash == "argon2id$fake$hash"
     assert relu.last_login is None
+
+
+def test_step_kind_par_defaut_est_engine(session):
+    """D1 : sans précision, une étape appelle bootstrap.sh (ENGINE) — c'est le
+    cas majoritaire du pipeline actuel, PYTHON reste l'exception déclarée."""
+    t = _cible(session)
+    app = App(name="mon-app", target_id=t.id, spec={"name": "mon-app", "services": []})
+    session.add(app)
+    session.commit()
+    run = Run(app_id=app.id, rq_job_id="job-kind")
+    session.add(run)
+    session.commit()
+    step = Step(run_id=run.id, name="check_prereqs", ordinal=0)
+    session.add(step)
+    session.commit()
+    assert step.kind is StepKind.ENGINE
+
+
+def test_app_sans_cible_est_refusee(session):
+    """target_id est obligatoire : une App sans cible n'a pas de sens (c'est
+    elle qui dit à l'engine et au worker où déployer)."""
+    app = App(name="sans-cible", target_id=None, spec={"name": "sans-cible", "services": []})
+    session.add(app)
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+
+def test_suppression_dune_cible_utilisee_est_refusee(session):
+    """RESTRICT (Target -> App) : une cible qui héberge une App ne doit
+    jamais être effacée en silence, sous peine de laisser l'App avec un
+    target_id fantôme."""
+    t = _cible(session)
+    app = App(name="mon-app", target_id=t.id, spec={"name": "mon-app", "services": []})
+    session.add(app)
+    session.commit()
+
+    session.delete(t)
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+    # La cible et son App sont toujours là : la suppression a bien été refusée.
+    assert session.get(Target, t.id) is not None
+    assert session.get(App, app.id) is not None
+
+
+def test_suppression_dune_app_emporte_ses_runs(session):
+    """CASCADE (App -> Run) : un Run est un historique d'exécution qui n'a
+    pas de sens sans son App ; le jalon 3 doit pouvoir détruire une
+    application sans purger son historique à la main."""
+    t = _cible(session)
+    app = App(name="mon-app", target_id=t.id, spec={"name": "mon-app", "services": []})
+    session.add(app)
+    session.commit()
+    run = Run(app_id=app.id, rq_job_id="job-cascade-app")
+    session.add(run)
+    session.commit()
+    run_id = run.id
+
+    session.delete(app)
+    session.commit()
+
+    assert session.get(Run, run_id) is None
+
+
+def test_suppression_dun_run_emporte_ses_etapes(session):
+    """CASCADE (Run -> Step) : une Step n'a aucune existence propre une fois
+    son Run supprimé."""
+    t = _cible(session)
+    app = App(name="mon-app", target_id=t.id, spec={"name": "mon-app", "services": []})
+    session.add(app)
+    session.commit()
+    run = Run(app_id=app.id, rq_job_id="job-cascade-run")
+    session.add(run)
+    session.commit()
+    step = Step(run_id=run.id, name="check_prereqs", ordinal=0)
+    session.add(step)
+    session.commit()
+    step_id = step.id
+
+    session.delete(run)
+    session.commit()
+
+    assert session.get(Step, step_id) is None
+
+
+def test_suppression_dune_app_emporte_transitivement_ses_etapes(session):
+    """La cascade App -> Run -> Step doit se propager sur deux niveaux : la
+    suppression d'une App ne doit laisser aucune Step orpheline."""
+    t = _cible(session)
+    app = App(name="mon-app", target_id=t.id, spec={"name": "mon-app", "services": []})
+    session.add(app)
+    session.commit()
+    run = Run(app_id=app.id, rq_job_id="job-cascade-transitive")
+    session.add(run)
+    session.commit()
+    step = Step(run_id=run.id, name="check_prereqs", ordinal=0)
+    session.add(step)
+    session.commit()
+    step_id = step.id
+
+    session.delete(app)
+    session.commit()
+
+    assert session.get(Step, step_id) is None

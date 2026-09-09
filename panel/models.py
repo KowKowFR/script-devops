@@ -8,7 +8,7 @@ d'état .bootstrap-state.
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import JSON, Column, UniqueConstraint
+from sqlalchemy import JSON, Column
 from sqlmodel import Field, SQLModel
 
 
@@ -79,13 +79,16 @@ class Target(SQLModel, table=True):
 
 
 class App(SQLModel, table=True):
-    __table_args__ = (UniqueConstraint("name", name="uq_app_name"),)
-
     id: int | None = Field(default=None, primary_key=True)
     # name == slug == workspace == répertoire == projet Compose == réseau Docker
     # Validé par ^[a-z][a-z0-9-]{1,30}$ AVANT l'insertion (D5, panel/spec.py).
-    name: str = Field(index=True, max_length=31)
-    target_id: int = Field(foreign_key="target.id")
+    # unique=True + index=True (et non une UniqueConstraint séparée) : un seul
+    # index, comme Target.name et User.username.
+    name: str = Field(unique=True, index=True, max_length=31)
+    # RESTRICT : une cible qui héberge des applications ne doit jamais être
+    # supprimée en silence — l'App resterait avec un target_id fantôme.
+    # Il faut d'abord réassigner ou supprimer les Apps qui la référencent.
+    target_id: int = Field(foreign_key="target.id", ondelete="RESTRICT")
     spec: dict = Field(sa_column=Column(JSON), default_factory=dict)
     env: dict = Field(sa_column=Column(JSON), default_factory=dict)   # NON secret
     secrets_enc: str | None = None                                   # blob opaque (Fernet, worker)
@@ -101,7 +104,10 @@ class App(SQLModel, table=True):
 
 class Run(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    app_id: int = Field(foreign_key="app.id", index=True)
+    # CASCADE : un Run est un historique d'exécution qui n'a pas de sens sans
+    # son App ; le supprimer avec elle évite d'avoir à nettoyer l'historique
+    # à la main avant de pouvoir détruire une application (jalon 3).
+    app_id: int = Field(foreign_key="app.id", index=True, ondelete="CASCADE")
     trigger: RunTrigger = Field(default=RunTrigger.MANUAL)
     status: RunStatus = Field(default=RunStatus.QUEUED, index=True)
     rq_job_id: str | None = Field(default=None, index=True)   # D4
@@ -113,7 +119,9 @@ class Run(SQLModel, table=True):
 
 class Step(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    run_id: int = Field(foreign_key="run.id", index=True)
+    # CASCADE : une Step est une instance d'exécution d'un Run précis (D2),
+    # elle n'a aucune existence propre une fois ce Run supprimé.
+    run_id: int = Field(foreign_key="run.id", index=True, ondelete="CASCADE")
     name: str = Field(index=True, max_length=64)
     ordinal: int
     kind: StepKind = Field(default=StepKind.ENGINE)
