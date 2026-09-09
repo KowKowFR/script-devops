@@ -66,6 +66,31 @@ if [[ -n "${SPEC_JSON:-}" && -f "$SPEC_JSON" ]]; then
 fi
 [[ -n "$HEALTH_CHECK_CMDS" ]] || HEALTH_CHECK_CMDS="true"
 
+# ----- Port SSH non standard --------------------------------------------------
+# target.port (env.json) : 22 par défaut, exactement comme _target_port()
+# dans ssh_remote.sh (tâche 11) — même source de vérité, même défaut. Un
+# port non standard implique un secret GitHub TARGET_PORT (posé par
+# step_github_set_secrets, cf. steps.sh) : DOCKER_HOST=ssh://…:port en
+# tient compte, ainsi que le SSH direct du contrôle de santé (et
+# ssh-keyscan, dans les blocs Setup SSH plus bas).
+#
+# Avec le port par défaut (absent d'env.json, ou 22 explicite), rien ne
+# change dans le YAML généré : ni secret TARGET_PORT créé côté GitHub, ni
+# référence à ce secret dans le workflow — le port ne devient un secret
+# QUE quand il en faut un.
+TARGET_PORT_NONDEFAULT=0
+if [[ -n "${ENV_JSON:-}" && -f "$ENV_JSON" ]]; then
+  _target_port_cfg="$(jq -r '.target.port // empty' "$ENV_JSON" 2>/dev/null || printf '')"
+  [[ -n "$_target_port_cfg" && "$_target_port_cfg" != "22" ]] && TARGET_PORT_NONDEFAULT=1
+fi
+
+DOCKER_HOST_URL='ssh://${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}'
+SSH_PORT_FLAG=''
+if [[ "$TARGET_PORT_NONDEFAULT" -eq 1 ]]; then
+  DOCKER_HOST_URL='ssh://${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}:${{ secrets.TARGET_PORT }}'
+  SSH_PORT_FLAG=' -p ${{ secrets.TARGET_PORT }}'
+fi
+
 # ----- Blocs spécifiques au mode d'authentification --------------------------
 # `IFS= read -r -d ''` assigne un heredoc multi-ligne sans backslash hell.
 # - IFS= : conserve les whitespace de début (indentation YAML).
@@ -89,7 +114,7 @@ if [[ "$TARGET_AUTH_METHOD" == "password" ]]; then
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           mkdir -p ~/.ssh "$HOME/.local/bin"
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan@@SSH_PORT_FLAG@@ -H "$SSH_HOST" >> ~/.ssh/known_hosts
           # DOCKER_HOST=ssh://… (job env, plus bas) invoque en interne le
           # binaire `ssh` du PATH, qui ne sait pas gérer un mot de passe
           # seul. On installe un wrapper prioritaire dans le PATH plutôt que
@@ -117,8 +142,10 @@ EOF
 
   # Le wrapper installé par Setup SSH absorbe déjà sshpass : plus besoin de
   # l'invoquer explicitement ici, un seul chemin (le wrapper) gère les deux
-  # usages (SSH direct et DOCKER_HOST).
-  SSH_CMD='ssh'
+  # usages (SSH direct et DOCKER_HOST). Le port, lui, n'est jamais absorbé
+  # par le wrapper : il doit être passé explicitement à CHAQUE appel direct
+  # (le wrapper se contente de relayer "$@" tel quel à sshpass/ssh).
+  SSH_CMD="ssh${SSH_PORT_FLAG}"
 else
   IFS= read -r -d '' SETUP_SSH_BLOCK <<'EOF' || true
       - name: Setup SSH (key mode)
@@ -131,10 +158,14 @@ else
           chmod 600 ~/.ssh/deploy_key
           head -n 1 ~/.ssh/deploy_key
           ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null && echo "Clé valide"
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan@@SSH_PORT_FLAG@@ -H "$SSH_HOST" >> ~/.ssh/known_hosts
           # DOCKER_HOST=ssh://… (job env, plus bas) invoque `ssh` sans
           # option -i : ~/.ssh/config lui fournit l'identité, sans ajouter
           # de 2e mécanisme de connexion à côté du SSH direct ci-dessus.
+          # Le port n'y est PAS ajouté : DOCKER_HOST encode déjà le port
+          # dans son URL (ssh://…:port), qui prime toujours sur ~/.ssh/config
+          # — et le SSH direct plus bas (contrôle de santé) reçoit -p
+          # explicitement, cf. SSH_CMD.
           printf 'Host *\n  IdentityFile ~/.ssh/deploy_key\n  StrictHostKeyChecking accept-new\n' >> ~/.ssh/config
           chmod 600 ~/.ssh/config
 EOF
@@ -146,8 +177,16 @@ EOF
 EOF
 
   SSH_ENV=''
-  SSH_CMD='ssh -i ~/.ssh/deploy_key'
+  SSH_CMD="ssh -i ~/.ssh/deploy_key${SSH_PORT_FLAG}"
 fi
+
+# Les deux SETUP_SSH_BLOCK ci-dessus sont capturés via un heredoc SIMPLEMENT
+# quoté (<<'EOF') — aucune expansion bash n'y a lieu, exprès : ils
+# contiennent du \${{ … }} (syntaxe GitHub Actions) qui serait sinon une
+# erreur de syntaxe bash (${{ n'est pas une expansion de paramètre valide).
+# Le placeholder @@SSH_PORT_FLAG@@ substitué ICI, après capture, est donc la
+# seule façon d'y injecter le port sans casser cette protection.
+SETUP_SSH_BLOCK="${SETUP_SSH_BLOCK//@@SSH_PORT_FLAG@@/$SSH_PORT_FLAG}"
 
 # ----- Génération du fichier ------------------------------------------------
 mkdir -p "$WORK_DIR/.github/workflows"
@@ -283,7 +322,7 @@ jobs:
       # lib/ssh_remote.sh) : on pilote le démon Docker DISTANT depuis le
       # compose.yml LOCAL au runner (checkouté juste après). Pas de fichiers
       # à copier sur la cible.
-      DOCKER_HOST: ssh://\${{ secrets.TARGET_USER }}@\${{ secrets.TARGET_HOST }}
+      DOCKER_HOST: ${DOCKER_HOST_URL}
     steps:
       - uses: actions/checkout@v4
 

@@ -23,6 +23,18 @@ _step_block() {
   ' "$file"
 }
 
+# _job_if_block FICHIER — isole le bloc scalaire `if: |` (multi-lignes) du
+# job `deploy` : c'est le seul `if: |` du fichier (les jobs build-and-push-*
+# utilisent un `if:` sur une seule ligne).
+_job_if_block() {
+  local file="$1"
+  awk '
+    /^    if: \|$/ { f=1; next }
+    f && /^    runs-on:/ { exit }
+    f { print }
+  ' "$file"
+}
+
 # env.json minimal : seuls les ports comptent pour gen_workflow.sh (contrôle
 # de santé), le reste est ignoré par ce générateur.
 ENV_FIX="$WORK/env.json"
@@ -80,6 +92,22 @@ assert_contains "$deploy_step" " pull" \
   "mode clé : le déploiement lance docker compose pull"
 assert_contains "$body_key" "DOCKER_HOST: ssh://" \
   "mode clé : docker compose est piloté contre le démon Docker DISTANT (DOCKER_HOST=ssh://)"
+
+# Le job `deploy` ne doit se déclencher QUE si un changement pertinent a été
+# détecté (api, web, ou deploy/** — le filtre 'deploy' du paths-filter plus
+# haut). Sans cette clause, IMAGE_TAG serait réécrit avec le SHA courant à
+# CHAQUE push sur main (y compris un changement docs/-only), alors qu'aucune
+# image n'a été poussée sous ce SHA pour aucun service — `docker compose
+# pull` échouerait à coup sûr, un job rouge à chaque commit hors-code.
+deploy_if_block=$(_job_if_block "$WF_KEY")
+assert_contains "$deploy_if_block" "needs.detect-changes.outputs.api == 'true'" \
+  "mode clé : le déploiement se déclenche si l'api a changé"
+assert_contains "$deploy_if_block" "needs.detect-changes.outputs.web == 'true'" \
+  "mode clé : le déploiement se déclenche si le web a changé"
+assert_contains "$deploy_if_block" "needs.detect-changes.outputs.deploy == 'true'" \
+  "mode clé : le déploiement se déclenche aussi si deploy/** a changé (compose.yml, .env.example…)"
+assert_contains "$body_key" $'deploy:\n              - \'deploy/**\'' \
+  "mode clé : le filtre paths-filter 'deploy' surveille bien deploy/**"
 
 # Le contrôle de santé cible 127.0.0.1 (jamais une URL publique), construit
 # depuis spec.json (services exposés + health) et env.json (ports hôte).
@@ -173,5 +201,61 @@ else
   _t_fail "les deux modes d'authentification (clé/mot de passe) produisent des workflows différents" \
     "les deux fichiers générés sont identiques"
 fi
+
+# ==========================================================================
+# Port SSH non standard (target.port)
+# ==========================================================================
+# La tâche 11 fait déjà respecter target.port côté panel (_target_port dans
+# ssh_remote.sh) ; le CI doit faire pareil — la cible de test réelle tourne
+# sur 60122 (le 22 exige root), un CI qui l'ignore échouerait à la joindre.
+ENV_PORT_FIX="$WORK/env_port.json"
+cat > "$ENV_PORT_FIX" <<'EOF'
+{ "ports": { "api": 10001, "web": 10002 }, "target": { "port": 60122 } }
+EOF
+
+_gen_workflow_env() {
+  local out="$1" auth="$2" env_json="$3"
+  APP_NAME="demo-app" TARGET_AUTH_METHOD="$auth" SPEC_JSON="$SPEC_FIX" ENV_JSON="$env_json" \
+    bash "$ENGINE_DIR/lib/gen_workflow.sh" "$out" >/dev/null 2>&1
+  printf '%s' "$?"
+}
+
+PORT_KEY_DIR="$WORK/port_key"
+rc_port_key=$(_gen_workflow_env "$PORT_KEY_DIR" "key" "$ENV_PORT_FIX")
+assert_eq "0" "$rc_port_key" "port non standard : gen_workflow.sh réussit (mode clé)"
+WF_PORT_KEY="$PORT_KEY_DIR/.github/workflows/deploy.yml"
+body_port_key=$(cat "$WF_PORT_KEY")
+
+assert_contains "$body_port_key" 'DOCKER_HOST: ssh://${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}:${{ secrets.TARGET_PORT }}' \
+  "port non standard : DOCKER_HOST référence le secret TARGET_PORT"
+assert_contains "$body_port_key" 'ssh-keyscan -p ${{ secrets.TARGET_PORT }} -H' \
+  "port non standard : ssh-keyscan reçoit -p \${{ secrets.TARGET_PORT }}"
+assert_contains "$body_port_key" 'ssh -i ~/.ssh/deploy_key -p ${{ secrets.TARGET_PORT }}' \
+  "port non standard (mode clé) : le contrôle de santé SSH direct reçoit -p \${{ secrets.TARGET_PORT }}"
+assert_exit_code 0 "port non standard (mode clé) : deploy.yml généré est du YAML valide (PyYAML)" -- \
+  python3 -c "import yaml; yaml.safe_load(open('$WF_PORT_KEY'))"
+
+PORT_PW_DIR="$WORK/port_password"
+rc_port_pw=$(_gen_workflow_env "$PORT_PW_DIR" "password" "$ENV_PORT_FIX")
+assert_eq "0" "$rc_port_pw" "port non standard : gen_workflow.sh réussit (mode mot de passe)"
+WF_PORT_PW="$PORT_PW_DIR/.github/workflows/deploy.yml"
+body_port_pw=$(cat "$WF_PORT_PW")
+
+assert_contains "$body_port_pw" 'DOCKER_HOST: ssh://${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}:${{ secrets.TARGET_PORT }}' \
+  "port non standard (mode mot de passe) : DOCKER_HOST référence le secret TARGET_PORT"
+# Le wrapper sshpass (installé par Setup SSH) relaie "$@" tel quel : le -p
+# passé à l'appel ssh direct lui arrive donc sans traitement spécial.
+assert_contains "$body_port_pw" 'ssh -p ${{ secrets.TARGET_PORT }}' \
+  "port non standard (mode mot de passe) : le wrapper sshpass reçoit -p \${{ secrets.TARGET_PORT }} (relayé tel quel via \"\$@\")"
+assert_exit_code 0 "port non standard (mode mot de passe) : deploy.yml généré est du YAML valide (PyYAML)" -- \
+  python3 -c "import yaml; yaml.safe_load(open('$WF_PORT_PW'))"
+
+# Port par défaut (fixtures ENV_FIX déjà générées plus haut, sans
+# target.port) : AUCUNE référence à TARGET_PORT nulle part — pas de
+# régression pour une cible sur le port standard.
+assert_not_contains "$body_key" "TARGET_PORT" \
+  "port par défaut : aucune référence au secret TARGET_PORT (rien ne change)"
+assert_not_contains "$body_pw" "TARGET_PORT" \
+  "port par défaut (mode mot de passe) : aucune référence au secret TARGET_PORT"
 
 finish

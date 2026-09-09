@@ -345,6 +345,16 @@ step_github_set_secrets() {
   _gh secret set TARGET_HOST        --repo "$repo" --body "$t_host"    >&2 && n=$((n+1))
   _gh secret set TARGET_USER        --repo "$repo" --body "$t_user"    >&2 && n=$((n+1))
 
+  # TARGET_PORT : uniquement pour un port SSH non standard — même défaut 22
+  # que _target_port() dans ssh_remote.sh (tâche 11), même source de vérité
+  # (target.port). Avec le port par défaut, aucun secret TARGET_PORT n'est
+  # créé côté GitHub : gen_workflow.sh ne le référence pas non plus dans ce
+  # cas (cf. TARGET_PORT_NONDEFAULT), le workflow généré reste inchangé.
+  local t_port; t_port="$(cfg target.port 22)"
+  if [[ "$t_port" != "22" ]]; then
+    _gh secret set TARGET_PORT --repo "$repo" --body "$t_port" >&2 && n=$((n+1))
+  fi
+
   if [[ "$(cfg target.auth_method key)" == "password" ]]; then
     local t_pass; _capture t_pass cfg_req target.password
     _gh secret set TARGET_PASSWORD --repo "$repo" --body "$t_pass" >&2 && n=$((n+1))
